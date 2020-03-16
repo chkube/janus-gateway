@@ -4,7 +4,7 @@
  * \brief    Utilities and helpers
  * \details  Implementations of a few methods that may be of use here
  * and there in the code.
- * 
+ *
  * \ingroup core
  * \ref core
  */
@@ -20,8 +20,11 @@
 #include <arpa/inet.h>
 #include <inttypes.h>
 
+#include <zlib.h>
+
 #include "utils.h"
 #include "debug.h"
+#include "mutex.h"
 
 #if __MACH__
 #include "mach_gettime.h"
@@ -87,10 +90,79 @@ guint64 janus_random_uint64(void) {
 	return num;
 }
 
+char *janus_random_uuid(void) {
+#if GLIB_CHECK_VERSION(2, 52, 0)
+	return g_uuid_string_random();
+#else
+	/* g_uuid_string_random is only available from glib 2.52, so if it's
+	 * not available we have to do it manually: the following code is
+	 * heavily based on https://github.com/rxi/uuid4 (MIT license) */
+	const char *template = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx";
+	const char *samples = "0123456789abcdef";
+	union { unsigned char b[16]; uint64_t word[2]; } rnd;
+	rnd.word[0] = janus_random_uint64();
+	rnd.word[1] = janus_random_uint64();
+	/* Generate the string */
+	char uuid[37], *dst = uuid;
+	const char *p = template;
+	int i = 0, n = 0;
+	while(*p) {
+		n = rnd.b[i >> 1];
+		n = (i & 1) ? (n >> 4) : (n & 0xf);
+		switch (*p) {
+			case 'x':
+				*dst = samples[n];
+				i++;
+				break;
+			case 'y':
+				*dst = samples[(n & 0x3) + 8];
+				i++;
+				break;
+			default:
+				*dst = *p;
+		}
+		p++;
+		dst++;
+	}
+	uuid[36] = '\0';
+	return g_strdup(uuid);
+#endif
+}
+
 guint64 *janus_uint64_dup(guint64 num) {
 	guint64 *numdup = g_malloc(sizeof(guint64));
 	*numdup = num;
 	return numdup;
+}
+
+int janus_string_to_uint8(const char *str, uint8_t *num) {
+	if(str == NULL || num == NULL)
+		return -EINVAL;
+	long int val = strtol(str, 0, 10);
+	if(val < 0 || val > UINT8_MAX)
+		return -ERANGE;
+	*num = val;
+	return 0;
+}
+
+int janus_string_to_uint16(const char *str, uint16_t *num) {
+	if(str == NULL || num == NULL)
+		return -EINVAL;
+	long int val = strtol(str, 0, 10);
+	if(val < 0 || val > UINT16_MAX)
+		return -ERANGE;
+	*num = val;
+	return 0;
+}
+
+int janus_string_to_uint32(const char *str, uint32_t *num) {
+	if(str == NULL || num == NULL)
+		return -EINVAL;
+	long long int val = strtoll(str, 0, 10);
+	if(val < 0 || val > UINT32_MAX)
+		return -ERANGE;
+	*num = val;
+	return 0;
 }
 
 void janus_flags_reset(janus_flags *flags) {
@@ -366,7 +438,7 @@ int janus_pidfile_create(const char *file) {
 		return 0;
 	pidfile = g_strdup(file);
 	/* Try creating a PID file (or opening an existing one) */
-	pidfd = open(pidfile, O_RDWR|O_CREAT, 0644);
+	pidfd = open(pidfile, O_RDWR|O_CREAT|O_TRUNC, 0644);
 	if(pidfd < 0) {
 		JANUS_LOG(LOG_FATAL, "Error opening/creating PID file %s, does Janus have enough permissions?\n", pidfile);
 		return -1;
@@ -415,6 +487,58 @@ int janus_pidfile_remove(void) {
 	g_free(pidfile);
 	return 0;
 }
+
+/* Protected folders management */
+static GList *protected_folders = NULL;
+static janus_mutex pf_mutex = JANUS_MUTEX_INITIALIZER;
+
+void janus_protected_folder_add(const char *folder) {
+	if(folder == NULL)
+		return;
+	janus_mutex_lock(&pf_mutex);
+	protected_folders = g_list_append(protected_folders, g_strdup(folder));
+	janus_mutex_unlock(&pf_mutex);
+}
+
+gboolean janus_is_folder_protected(const char *path) {
+	/* We need a valid pathname (can't start with a space, we don't trim) */
+	if(path == NULL || *path == ' ')
+		return TRUE;
+	/* Resolve the pathname to its real path first */
+	char resolved[PATH_MAX+1];
+	resolved[0] = '\0';
+	if(realpath(path, resolved) == NULL && errno != ENOENT) {
+		JANUS_LOG(LOG_ERR, "Error resolving path '%s'... %d (%s)\n",
+			path, errno, strerror(errno));
+		return TRUE;
+	}
+	/* Traverse the list of protected folders to see if any match */
+	janus_mutex_lock(&pf_mutex);
+	if(protected_folders == NULL) {
+		/* No protected folder in the list */
+		janus_mutex_unlock(&pf_mutex);
+		return FALSE;
+	}
+	gboolean protected = FALSE;
+	GList *temp = protected_folders;
+	while(temp) {
+		char *folder = (char *)temp->data;
+		if(folder && (strstr(resolved, folder) == resolved)) {
+			protected = TRUE;
+			break;
+		}
+		temp = temp->next;
+	}
+	janus_mutex_unlock(&pf_mutex);
+	return protected;
+}
+
+void janus_protected_folders_clear(void) {
+	janus_mutex_lock(&pf_mutex);
+	g_list_free_full(protected_folders, (GDestroyNotify)g_free);
+	janus_mutex_unlock(&pf_mutex);
+}
+
 
 void janus_get_json_type_name(int jtype, unsigned int flags, char *type_name) {
 	/* Longest possible combination is "a non-empty boolean" plus one for null char */
@@ -496,8 +620,8 @@ gboolean janus_json_is_valid(json_t *val, json_type jtype, unsigned int flags) {
 	# define swap2(d) d
 #endif
 
-gboolean janus_vp8_is_keyframe(char* buffer, int len) {
-	if(!buffer || len < 0)
+gboolean janus_vp8_is_keyframe(const char *buffer, int len) {
+	if(!buffer || len < 16)
 		return FALSE;
 	/* Parse VP8 header now */
 	uint8_t vp8pd = *buffer;
@@ -555,10 +679,13 @@ gboolean janus_vp8_is_keyframe(char* buffer, int len) {
 				if(c[0]!=0x9d||c[1]!=0x01||c[2]!=0x2a) {
 					JANUS_LOG(LOG_HUGE, "First 3-bytes after header not what they're supposed to be?\n");
 				} else {
-					int vp8w = swap2(*(unsigned short*)(c+3))&0x3fff;
-					int vp8ws = swap2(*(unsigned short*)(c+3))>>14;
-					int vp8h = swap2(*(unsigned short*)(c+5))&0x3fff;
-					int vp8hs = swap2(*(unsigned short*)(c+5))>>14;
+					unsigned short val3, val5;
+					memcpy(&val3,c+3,sizeof(short));
+					int vp8w = swap2(val3)&0x3fff;
+					int vp8ws = swap2(val3)>>14;
+					memcpy(&val5,c+5,sizeof(short));
+					int vp8h = swap2(val5)&0x3fff;
+					int vp8hs = swap2(val5)>>14;
 					JANUS_LOG(LOG_HUGE, "Got a VP8 key frame: %dx%d (scale=%dx%d)\n", vp8w, vp8h, vp8ws, vp8hs);
 					return TRUE;
 				}
@@ -569,8 +696,8 @@ gboolean janus_vp8_is_keyframe(char* buffer, int len) {
 	return FALSE;
 }
 
-gboolean janus_vp9_is_keyframe(char* buffer, int len) {
-	if(!buffer || len < 0)
+gboolean janus_vp9_is_keyframe(const char *buffer, int len) {
+	if(!buffer || len < 16)
 		return FALSE;
 	/* Parse VP9 header now */
 	uint8_t vp9pd = *buffer;
@@ -580,6 +707,7 @@ gboolean janus_vp9_is_keyframe(char* buffer, int len) {
 	uint8_t fbit = (vp9pd & 0x10);
 	uint8_t vbit = (vp9pd & 0x02);
 	buffer++;
+	len--;
 	if(ibit) {
 		/* Read the PictureID octet */
 		vp9pd = *buffer;
@@ -587,18 +715,22 @@ gboolean janus_vp9_is_keyframe(char* buffer, int len) {
 		uint8_t mbit = (vp9pd & 0x80);
 		if(!mbit) {
 			buffer++;
+			len--;
 		} else {
 			memcpy(&picid, buffer, sizeof(uint16_t));
 			wholepicid = ntohs(picid);
 			picid = (wholepicid & 0x7FFF);
 			buffer += 2;
+			len -= 2;
 		}
 	}
 	if(lbit) {
 		buffer++;
+		len--;
 		if(!fbit) {
 			/* Non-flexible mode, skip TL0PICIDX */
 			buffer++;
+			len--;
 		}
 	}
 	if(fbit && pbit) {
@@ -608,6 +740,9 @@ gboolean janus_vp9_is_keyframe(char* buffer, int len) {
 			vp9pd = *buffer;
 			nbit = (vp9pd & 0x01);
 			buffer++;
+			len--;
+			if(len == 0)	/* Make sure we don't overflow */
+				return FALSE;
 		}
 	}
 	if(vbit) {
@@ -619,15 +754,20 @@ gboolean janus_vp9_is_keyframe(char* buffer, int len) {
 		if(ybit) {
 			/* Iterate on all spatial layers and get resolution */
 			buffer++;
+			len--;
+			if(len == 0)	/* Make sure we don't overflow */
+				return FALSE;
 			uint i=0;
-			for(i=0; i<n_s; i++) {
+			for(i=0; i<n_s && len>=4; i++,len-=4) {
 				/* Width */
-				uint16_t *w = (uint16_t *)buffer;
-				int vp9w = ntohs(*w);
+				uint16_t w;
+				memcpy(&w, buffer, sizeof(uint16_t));
+				int vp9w = ntohs(w);
 				buffer += 2;
 				/* Height */
-				uint16_t *h = (uint16_t *)buffer;
-				int vp9h = ntohs(*h);
+				uint16_t h;
+				memcpy(&h, buffer, sizeof(uint16_t));
+				int vp9h = ntohs(h);
 				buffer += 2;
 				if(vp9w || vp9h) {
 					JANUS_LOG(LOG_HUGE, "Got a VP9 key frame: %dx%d\n", vp9w, vp9h);
@@ -640,17 +780,34 @@ gboolean janus_vp9_is_keyframe(char* buffer, int len) {
 	return FALSE;
 }
 
-gboolean janus_h264_is_keyframe(char* buffer, int len) {
-	if(!buffer || len < 0)
+gboolean janus_h264_is_keyframe(const char *buffer, int len) {
+	if(!buffer || len < 6)
 		return FALSE;
 	/* Parse H264 header now */
 	uint8_t fragment = *buffer & 0x1F;
 	uint8_t nal = *(buffer+1) & 0x1F;
-	uint8_t start_bit = *(buffer+1) & 0x80;
-	if(fragment == 5 ||
-			((fragment == 28 || fragment == 29) && nal == 5 && start_bit == 128)) {
+	if(fragment == 7 || ((fragment == 28 || fragment == 29) && nal == 7)) {
 		JANUS_LOG(LOG_HUGE, "Got an H264 key frame\n");
 		return TRUE;
+	} else if(fragment == 24) {
+		/* May we find an SPS in this STAP-A? */
+		buffer++;
+		len--;
+		uint16_t psize = 0;
+		/* We're reading 3 bytes */
+		while(len > 2) {
+			memcpy(&psize, buffer, 2);
+			psize = ntohs(psize);
+			buffer += 2;
+			len -= 2;
+			int nal = *buffer & 0x1F;
+			if(nal == 7) {
+				JANUS_LOG(LOG_HUGE, "Got an SPS/PPS\n");
+				return TRUE;
+			}
+			buffer += psize;
+			len -= psize;
+		}
 	}
 	/* If we got here it's not a key frame */
 	return FALSE;
@@ -658,7 +815,7 @@ gboolean janus_h264_is_keyframe(char* buffer, int len) {
 
 int janus_vp8_parse_descriptor(char *buffer, int len,
 		uint16_t *picid, uint8_t *tl0picidx, uint8_t *tid, uint8_t *y, uint8_t *keyidx) {
-	if(!buffer || len < 0)
+	if(!buffer || len < 6)
 		return -1;
 	if(picid)
 		*picid = 0;
@@ -718,7 +875,7 @@ int janus_vp8_parse_descriptor(char *buffer, int len,
 }
 
 static int janus_vp8_replace_descriptor(char *buffer, int len, uint16_t picid, uint8_t tl0picidx) {
-	if(!buffer || len < 0)
+	if(!buffer || len < 6)
 		return -1;
 	uint8_t vp8pd = *buffer;
 	uint8_t xbit = (vp8pd & 0x80);
@@ -794,10 +951,8 @@ void janus_vp8_simulcast_descriptor_update(char *buffer, int len, janus_vp8_simu
 
 /* Helper method to parse a VP9 RTP video frame and get some SVC-related info:
  * notice that this only works with VP9, right now, on an experimental basis */
-int janus_vp9_parse_svc(char *buffer, int len, int *found,
-		int *spatial_layer, int *temporal_layer,
-		uint8_t *p, uint8_t *d, uint8_t *u, uint8_t *b, uint8_t *e) {
-	if(!buffer || len < 0)
+int janus_vp9_parse_svc(char *buffer, int len, gboolean *found, janus_vp9_svc_info *info) {
+	if(!buffer || len < 8)
 		return -1;
 	/* VP9 depay: */
 		/* https://tools.ietf.org/html/draft-ietf-payload-vp9-04 */
@@ -813,7 +968,7 @@ int janus_vp9_parse_svc(char *buffer, int len, int *found,
 	if(!lbit) {
 		/* No Layer indices present, no need to go on */
 		if(found)
-			*found = 0;
+			*found = FALSE;
 		return 0;
 	}
 	/* Move to the next octet and see what's there */
@@ -842,24 +997,20 @@ int janus_vp9_parse_svc(char *buffer, int len, int *found,
 		uint8_t ubit = (vp9pd & 0x10) >> 4;
 		int slid = (vp9pd & 0x0E) >> 1;
 		uint8_t dbit = (vp9pd & 0x01);
-		JANUS_LOG(LOG_HUGE, "Parsed Layer indices: Temporal: %d (%u), Spatial: %d (%u)\n",
-			tlid, ubit, slid, dbit);
-		if(temporal_layer)
-			*temporal_layer = tlid;
-		if(spatial_layer)
-			*spatial_layer = slid;
-		if(p)
-			*p = pbit;
-		if(d)
-			*d = dbit;
-		if(u)
-			*u = ubit;
-		if(b)
-			*b = bbit;
-		if(e)
-			*e = ebit;
+		JANUS_LOG(LOG_HUGE, "%s Mode, Layer indices: Temporal: %d (u=%u), Spatial: %d (d=%u)\n",
+			fbit ? "Flexible" : "Non-flexible", tlid, ubit, slid, dbit);
+		if(info) {
+			info->temporal_layer = tlid;
+			info->spatial_layer = slid;
+			info->fbit = fbit;
+			info->pbit = pbit;
+			info->dbit = dbit;
+			info->ubit = ubit;
+			info->bbit = bbit;
+			info->ebit = ebit;
+		}
 		if(found)
-			*found = 1;
+			*found = TRUE;
 		/* Go on, just to get to the SS, if available (which we currently ignore anyway) */
 		buffer++;
 		len--;
@@ -877,6 +1028,8 @@ int janus_vp9_parse_svc(char *buffer, int len, int *found,
 			nbit = (vp9pd & 0x01);
 			buffer++;
 			len--;
+			if(len == 0)	/* Make sure we don't overflow */
+				return -1;
 		}
 	}
 	if(vbit) {
@@ -891,22 +1044,30 @@ int janus_vp9_parse_svc(char *buffer, int len, int *found,
 			/* Iterate on all spatial layers and get resolution */
 			buffer++;
 			len--;
+			if(len == 0)	/* Make sure we don't overflow */
+				return -1;
 			int i=0;
 			for(i=0; i<n_s; i++) {
 				/* Been there, done that: skip skip skip */
 				buffer += 4;
 				len -= 4;
+				if(len <= 0)	/* Make sure we don't overflow */
+					return -1;
 			}
 		}
 		if(gbit) {
 			if(!ybit) {
 				buffer++;
 				len--;
+				if(len == 0)	/* Make sure we don't overflow */
+					return -1;
 			}
 			uint8_t n_g = *buffer;
 			JANUS_LOG(LOG_HUGE, "There are %u frames in a GOF\n", n_g);
 			buffer++;
 			len--;
+			if(len == 0)	/* Make sure we don't overflow */
+				return -1;
 			if(n_g > 0) {
 				int i=0;
 				for(i=0; i<n_g; i++) {
@@ -917,9 +1078,13 @@ int janus_vp9_parse_svc(char *buffer, int len, int *found,
 						/* Skip reference indices */
 						buffer += r;
 						len -= r;
+						if(len <= 0)	/* Make sure we don't overflow */
+							return -1;
 					}
 					buffer++;
 					len--;
+					if(len == 0)	/* Make sure we don't overflow */
+						return -1;
 				}
 			}
 		}
@@ -952,3 +1117,43 @@ inline void janus_set4(guint8 *data,size_t i,guint32 val) {
 	data[i+1] = (guint8)(val>>16);
 	data[i]   = (guint8)(val>>24);
 }
+
+#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+size_t janus_gzip_compress(int compression, char *text, size_t tlen, char *compressed, size_t zlen) {
+	if(text == NULL || tlen < 1 || compressed == NULL || zlen < 1)
+		return -1;
+	if(compression < 0 || compression > 9) {
+		JANUS_LOG(LOG_WARN, "Invalid compression factor %d, falling back to default compression...\n", compression);
+		compression = Z_DEFAULT_COMPRESSION;
+	}
+
+	/* Initialize the deflater, and clarify we need gzip */
+	z_stream zs;
+	zs.zalloc = Z_NULL;
+	zs.zfree = Z_NULL;
+	zs.opaque = Z_NULL;
+	zs.next_in = (Bytef *)text;
+	zs.avail_in = (uInt)tlen+1;
+	zs.next_out = (Bytef *)compressed;
+	zs.avail_out = (uInt)zlen;
+	int res = deflateInit2(&zs, compression, Z_DEFLATED, 15 | 16, 8, Z_DEFAULT_STRATEGY);
+	if(res != Z_OK) {
+		JANUS_LOG(LOG_ERR, "deflateInit error: %d\n", res);
+		return 0;
+	}
+	/* Deflate the string */
+	res = deflate(&zs, Z_FINISH);
+	if(res != Z_STREAM_END) {
+		JANUS_LOG(LOG_ERR, "deflate error: %d\n", res);
+		return 0;
+	}
+	res = deflateEnd(&zs);
+	if(res != Z_OK) {
+		JANUS_LOG(LOG_ERR, "deflateEnd error: %d\n", res);
+		return 0;
+	}
+
+	/* Done, return the size of the compressed data */
+	return zs.total_out;
+}
+#endif

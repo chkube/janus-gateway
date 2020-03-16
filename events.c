@@ -4,16 +4,34 @@
  * \brief    Event handler notifications
  * \details  Event handler plugins can receive events from the Janus core
  * and other plugins, in order to handle them somehow. This methods
- * provide helpers to notify events to such handlers. 
- * 
+ * provide helpers to notify events to such handlers.
+ *
  * \ingroup core
  * \ref core
  */
- 
+
 #include <stdarg.h>
 
 #include "events.h"
 #include "utils.h"
+
+static struct janus_event_types {
+	int type;
+	const char *label;
+	const char *name;
+} event_types_string[] = {
+	{ JANUS_EVENT_TYPE_NONE, "no_events", "No events"},
+	{ JANUS_EVENT_TYPE_SESSION, "sessions", "Sessions"},
+	{ JANUS_EVENT_TYPE_HANDLE, "handles", "Handles"},
+	{ JANUS_EVENT_TYPE_EXTERNAL, "external", "External"},
+	{ JANUS_EVENT_TYPE_JSEP, "jsep", "Jsep"},
+	{ JANUS_EVENT_TYPE_WEBRTC, "webrtc", "WebRTC"},
+	{ JANUS_EVENT_TYPE_MEDIA, "media", "Media"},
+	{ JANUS_EVENT_TYPE_PLUGIN, "plugins", "Plugins"},
+	{ JANUS_EVENT_TYPE_TRANSPORT, "transports", "Transports"},
+	{ JANUS_EVENT_TYPE_CORE, "core", "Core"},
+	{ -1, NULL, NULL},
+};
 
 static gboolean eventsenabled = FALSE;
 static char *server = NULL;
@@ -64,7 +82,7 @@ gboolean janus_events_is_enabled(void) {
 	return eventsenabled;
 }
 
-void janus_events_notify_handlers(int type, guint64 session_id, ...) {
+void janus_events_notify_handlers(int type, int subtype, guint64 session_id, ...) {
 	/* This method has a variable list of arguments, depending on the event type */
 	va_list args;
 	va_start(args, session_id);
@@ -115,6 +133,8 @@ void janus_events_notify_handlers(int type, guint64 session_id, ...) {
 	if(server != NULL)
 		json_object_set_new(event, "emitter", json_string(server));
 	json_object_set_new(event, "type", json_integer(type));
+	if(subtype > 0)
+		json_object_set_new(event, "subtype", json_integer(subtype));
 	json_object_set_new(event, "timestamp", json_integer(janus_get_real_time()));
 	if(type != JANUS_EVENT_TYPE_CORE && type != JANUS_EVENT_TYPE_EXTERNAL) {
 		/* Core and Admin API originated events don't have a session ID */
@@ -251,13 +271,12 @@ void *janus_events_thread(void *data) {
 	while(eventsenabled) {
 		/* Any event in queue? */
 		event = g_async_queue_pop(events);
-		if(event == NULL)
-			continue;
 		if(event == &exit_event)
 			break;
 
 		/* Notify all interested handlers, increasing the event reference to make sure it's not lost because of errors */
 		int type = json_integer_value(json_object_get(event, "type"));
+		guint count = g_hash_table_size(eventhandlers);
 		GHashTableIter iter;
 		gpointer value;
 		g_hash_table_iter_init(&iter, eventhandlers);
@@ -268,7 +287,15 @@ void *janus_events_thread(void *data) {
 				continue;
 			if(!janus_flags_is_set(&e->events_mask, type))
 				continue;
-			e->incoming_event(event);
+			if(count == 1) {
+				/* Single event handler: pass this instance directly */
+				e->incoming_event(event);
+			} else {
+				/* Multiple event handlers, that may modify the event: pass a copy */
+				json_t *copy = json_deep_copy(event);
+				e->incoming_event(copy);
+				json_decref(copy);
+			}
 		}
 		json_decref(event);
 
@@ -284,4 +311,69 @@ void *janus_events_thread(void *data) {
 
 	JANUS_LOG(LOG_VERB, "Leaving Events handler thread\n");
 	return NULL;
+}
+
+/* Helper method to change the events mask */
+void janus_events_edit_events_mask(const char *list, janus_flags *target) {
+	if(!list)
+		return;
+	janus_flags mask;
+	janus_flags_reset(&mask);
+	if(!strcasecmp(list, "none")) {
+		/* Don't subscribe to anything at all */
+		janus_flags_reset(&mask);
+	} else if(!strcasecmp(list, "all")) {
+		/* Subscribe to everything */
+		janus_flags_set(&mask, JANUS_EVENT_TYPE_ALL);
+	} else {
+		/* Check what we need to subscribe to */
+		janus_flags_reset(&mask);
+		gchar **subscribe = g_strsplit(list, ",", -1);
+		if(subscribe != NULL) {
+			gchar *index = subscribe[0];
+			if(index != NULL) {
+				int i=0;
+				while(index != NULL) {
+					while(isspace(*index))
+						index++;
+					if(strlen(index)) {
+						struct janus_event_types *ev = event_types_string;
+						while(ev->label) {
+							if(!strcasecmp(index, ev->label)) {
+								janus_flags_set(&mask, ev->type);
+								break;
+							}
+							ev++;
+						}
+					}
+					i++;
+					index = subscribe[i];
+				}
+			}
+			g_strfreev(subscribe);
+		}
+	}
+	if(target)
+		memcpy(target, &mask, sizeof(janus_flags));
+}
+
+/* Helpers to convert an event type to a string label or a more verbose name */
+const char *janus_events_type_to_label(int type) {
+	struct janus_event_types *ev = event_types_string;
+	while(ev->label) {
+		if(type == ev->type)
+			return ev->label;
+		ev++;
+	}
+	return (char *)NULL;
+}
+
+const char *janus_events_type_to_name(int type) {
+	struct janus_event_types *ev = event_types_string;
+	while(ev->label) {
+		if(type == ev->type)
+			return ev->name;
+		ev++;
+	}
+	return (char *)NULL;
 }

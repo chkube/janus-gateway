@@ -23,12 +23,12 @@
 // 		var server = "ws://" + window.location.hostname + ":8188";
 //
 // Of course this assumes that support for WebSockets has been built in
-// when compiling the gateway. WebSockets support has not been tested
+// when compiling the server. WebSockets support has not been tested
 // as much as the REST API, so handle with care!
 //
 //
 // If you have multiple options available, and want to let the library
-// autodetect the best way to contact your gateway (or pool of gateways),
+// autodetect the best way to contact your server (or pool of servers),
 // you can also pass an array of servers, e.g., to provide alternative
 // means of access (e.g., try WebSockets first and, if that fails, fall
 // back to plain HTTP) or just have failover servers:
@@ -74,7 +74,7 @@ $(document).ready(function() {
 				{
 					server: server,
 					success: function() {
-						// Attach to text room plugin
+						// Attach to TextRoom plugin
 						janus.attach(
 							{
 								plugin: "janus.plugin.textroom",
@@ -163,6 +163,14 @@ $(document).ready(function() {
 											$('#chatroom').append('<p>[' + dateString + '] <b>' + participants[from] + ':</b> ' + msg);
 											$('#chatroom').get(0).scrollTop = $('#chatroom').get(0).scrollHeight;
 										}
+									} else if(what === "announcement") {
+										// Room announcement
+										var msg = json["text"];
+										msg = msg.replace(new RegExp('<', 'g'), '&lt');
+										msg = msg.replace(new RegExp('>', 'g'), '&gt');
+										var dateString = getDateString(json["date"]);
+										$('#chatroom').append('<p style="color: purple;">[' + dateString + '] <i>' + msg + '</i>');
+										$('#chatroom').get(0).scrollTop = $('#chatroom').get(0).scrollHeight;
 									} else if(what === "join") {
 										// Somebody joined
 										var username = json["username"];
@@ -277,7 +285,7 @@ function registerUsername() {
 					// This is a "no such room" error: give a more meaningful description
 					bootbox.alert(
 						"<p>Apparently room <code>" + myroom + "</code> (the one this demo uses as a test room) " +
-						"does not exist...</p><p>Do you have an updated <code>janus.plugin.textroom.cfg</code> " +
+						"does not exist...</p><p>Do you have an updated <code>janus.plugin.textroom.jcfg</code> " +
 						"configuration file? If not, make sure you copy the details of room <code>" + myroom + "</code> " +
 						"from that sample in your current configuration file, then restart Janus and try again."
 					);

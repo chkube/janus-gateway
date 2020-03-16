@@ -1,4 +1,5 @@
-AC_INIT([Janus Gateway],[0.4.3],[https://github.com/meetecho/janus-gateway],[janus-gateway],[https://janus.conf.meetecho.com])
+AC_INIT([Janus WebRTC Server],[0.9.2],[https://github.com/meetecho/janus-gateway],[janus-gateway],[https://janus.conf.meetecho.com])
+AC_LANG(C)
 AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIR([m4])
 
@@ -8,28 +9,83 @@ AC_ENABLE_STATIC(no)
 AM_INIT_AUTOMAKE([foreign subdir-objects])
 AM_SILENT_RULES([yes])
 
-AC_GNU_SOURCE
+#AC_GNU_SOURCE has been deprecated (https://www.gnu.org/software/autoconf/manual/autoconf-2.69/html_node/Obsolete-Macros.html)
+AC_USE_SYSTEM_EXTENSIONS
 
 AC_PROG_CC
 
 LT_PREREQ([2.2])
 LT_INIT
 
-JANUS_VERSION=43
+# Common CFLAGS
+CFLAGS="$CFLAGS \
+	-fPIC \
+	-fstack-protector-all \
+	-fstrict-aliasing \
+	-ggdb3 \
+	-pthread \
+	-Wall \
+	-Warray-bounds \
+	-Wextra \
+	-Wformat-nonliteral \
+	-Wformat-security \
+	-Wformat=2 \
+	-Winit-self \
+	-Winline \
+	-Wlarger-than=65537 \
+	-Wmissing-declarations \
+	-Wmissing-format-attribute \
+	-Wmissing-include-dirs \
+	-Wmissing-noreturn \
+	-Wmissing-prototypes \
+	-Wnested-externs \
+	-Wno-aggregate-return \
+	-Wno-missing-field-initializers \
+	-Wno-redundant-decls \
+	-Wno-undef \
+	-Wno-unused-parameter \
+	-Wold-style-definition \
+	-Wpacked \
+	-Wpointer-arith \
+	-Wsign-compare \
+	-Wstrict-prototypes \
+	-Wswitch-default \
+	-Wunused \
+	-Wwrite-strings"
+
+case "$CC" in
+clang*)
+	# Specific clang flags
+	CFLAGS="$CFLAGS \
+		-Wno-cast-align \
+		-Wno-initializer-overrides"
+;;
+*)
+	# Specific gcc flags
+	CFLAGS="$CFLAGS \
+		-Wcast-align \
+		-Wno-override-init \
+		-Wunsafe-loop-optimizations \
+		-Wunused-but-set-variable"
+esac
+
+JANUS_VERSION=92
 AC_SUBST(JANUS_VERSION)
-JANUS_VERSION_STRING="0.4.3"
+JANUS_VERSION_STRING="0.9.2"
 AC_SUBST(JANUS_VERSION_STRING)
 
 case "$host_os" in
 darwin*)
 	CFLAGS="$CFLAGS -I/usr/local/opt/openssl/include -I/usr/local/include"
+	# add rdynamic to LDFLAGS
+	LDFLAGS="$LDFLAGS -Wl,-export_dynamic"
 	LDFLAGS="$LDFLAGS -L/usr/local/lib -L/usr/local/opt/openssl/lib -L/opt/local/lib -L/usr/local/libsrtp/lib"
 	AM_CONDITIONAL([DARWIN_OS], true)
-	AM_CONDITIONAL([HAS_DTLS_WINDOW_SIZE], false)
 ;;
 *)
+	LDFLAGS="$LDFLAGS -Wl,--export-dynamic"
 	AM_CONDITIONAL([DARWIN_OS], false)
-	AM_CONDITIONAL([HAS_DTLS_WINDOW_SIZE], true)
+	AC_DEFINE(HAS_DTLS_WINDOW_SIZE, 1)
 esac
 
 glib_version=2.34
@@ -76,6 +132,12 @@ AC_ARG_ENABLE([dtls-settimeout],
               [],
               [enable_dtls_settimeout=no])
 
+AC_ARG_ENABLE([pthread-mutex],
+              [AS_HELP_STRING([--enable-pthread-mutex],
+                              [Use pthread_mutex instead of GMutex (see #1397)])],
+              [],
+              [enable_pthread_mutex=no])
+
 AC_ARG_ENABLE([turn-rest-api],
               [AS_HELP_STRING([--disable-turn-rest-api],
                               [Disable TURN REST API client (via libcurl)])],
@@ -98,8 +160,6 @@ AC_ARG_ENABLE([all-plugins],
                      [enable_plugin_recordplay=no])
                AS_IF([test "x$enable_plugin_sip" != "xyes"],
                      [enable_plugin_sip=no])
-               AS_IF([test "x$enable_plugin_sipre" != "xyes"],
-                     [enable_plugin_sipre=no])
                AS_IF([test "x$enable_plugin_nosip" != "xyes"],
                      [enable_plugin_nosip=no])
                AS_IF([test "x$enable_plugin_streaming" != "xyes"],
@@ -140,8 +200,23 @@ AC_ARG_ENABLE([all-handlers],
               [
                AS_IF([test "x$enable_sample_event_handler" != "xyes"],
                      [enable_sample_event_handler=no])
+               AS_IF([test "x$enable_websockets_event_handler" != "xyes"],
+                     [enable_websockets_event_handler=no])
                AS_IF([test "x$enable_rabbitmq_event_handler" != "xyes"],
                      [enable_rabbitmq_event_handler=no])
+               AS_IF([test "x$enable_mqtt_event_handler" != "xyes"],
+                     [enable_mqtt_event_handler=no])
+               AS_IF([test "x$enable_nanomsg_event_handler" != "xyes"],
+                     [enable_nanomsg_event_handler=no])
+              ],
+              [])
+
+AC_ARG_ENABLE([all-loggers],
+              [AS_HELP_STRING([--disable-all-loggers],
+                              [Disable building all loggers (except those manually enabled)])],
+              [
+               AS_IF([test "x$enable_json_logger" != "xyes"],
+                     [enable_json_logger=no])
               ],
               [])
 
@@ -205,12 +280,40 @@ AC_ARG_ENABLE([sample-event-handler],
                      [enable_sample_event_handler=no])],
               [enable_sample_event_handler=maybe])
 
+AC_ARG_ENABLE([websockets-event-handler],
+              [AS_HELP_STRING([--disable-websockets-event-handler],
+                              [Disable WebSockets event handler ])],
+              [AS_IF([test "x$enable_websockets_event_handler" != "xyes"],
+                     [enable_websockets_event_handler=no])],
+              [enable_websockets_event_handler=maybe])
+
 AC_ARG_ENABLE([rabbitmq-event-handler],
               [AS_HELP_STRING([--disable-rabbitmq-event-handler],
                               [Disable RabbitMQ event handler ])],
               [AS_IF([test "x$enable_rabbitmq_event_handler" != "xyes"],
                      [enable_rabbitmq_event_handler=no])],
               [enable_rabbitmq_event_handler=maybe])
+
+AC_ARG_ENABLE([mqtt-event-handler],
+              [AS_HELP_STRING([--disable-mqtt-event-handler],
+                              [Disable MQTT event handler ])],
+              [AS_IF([test "x$enable_mqtt_event_handler" != "xyes"],
+                     [enable_mqtt_event_handler=no])],
+              [enable_mqtt_event_handler=maybe])
+
+AC_ARG_ENABLE([nanomsg-event-handler],
+              [AS_HELP_STRING([--disable-nanomsg-event-handler],
+                              [Disable Nanomsg event handler ])],
+              [AS_IF([test "x$enable_nanomsg_event_handler" != "xyes"],
+                     [enable_nanomsg_event_handler=no])],
+              [enable_nanomsg_event_handler=maybe])
+
+AC_ARG_ENABLE([json-logger],
+              [AS_HELP_STRING([--enable-json-logger],
+                              [Enable external JSON file logger ])],
+              [AS_IF([test "x$enable_json_logger" != "xyes"],
+                     [enable_json_logger=no])],
+              [enable_json_logger=no])
 
 AC_ARG_ENABLE([systemd-sockets],
               [AS_HELP_STRING([--enable-systemd-sockets],
@@ -221,12 +324,14 @@ AC_ARG_ENABLE([systemd-sockets],
 PKG_CHECK_MODULES([JANUS],
                   [
                     glib-2.0 >= $glib_version
+					libconfig
                     nice
                     jansson >= $jansson_version
                     libssl >= $ssl_version
                     libcrypto
+                    zlib
                   ])
-JANUS_MANUAL_LIBS+=" -lm"
+JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -lm"
 AC_SUBST(JANUS_MANUAL_LIBS)
 
 AS_IF([test "x${boringssl_dir}" != "x"],
@@ -250,6 +355,13 @@ AS_IF([test "x$enable_dtls_settimeout" = "xyes"],
       ])
 AM_CONDITIONAL([ENABLE_DTLS_SETTIMEOUT], [test "x$enable_dtls_settimeout" = "xyes"])
 
+AS_IF([test "x$enable_pthread_mutex" = "xyes"],
+      [
+      AC_DEFINE(USE_PTHREAD_MUTEX)
+      AC_MSG_NOTICE([Will use pthread_mutex instead of GMutex])
+      ])
+AM_CONDITIONAL([ENABLE_PTHREAD_MUTEX], [test "x$enable_pthread_mutex" = "xyes"])
+
 AC_SEARCH_LIBS([tls_config_set_ca_mem],[tls],
              [AM_CONDITIONAL([LIBRESSL_DETECTED], true)],
              [AM_CONDITIONAL([LIBRESSL_DETECTED], false)]
@@ -269,7 +381,7 @@ AC_CHECK_LIB([nice],
 
 AC_CHECK_LIB([dl],
              [dlopen],
-             [JANUS_MANUAL_LIBS+=" -ldl"],
+             [JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -ldl"],
              [AC_MSG_ERROR([libdl not found.])])
 
 AM_CONDITIONAL([ENABLE_LIBSRTP_2], false)
@@ -280,7 +392,7 @@ AS_IF([test "x$enable_libsrtp2" != "xno"],
                       AC_CHECK_HEADER([srtp2/srtp.h],
                                       [
                                         AC_DEFINE(HAVE_SRTP_2)
-                                        JANUS_MANUAL_LIBS+=" -lsrtp2"
+                                        JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -lsrtp2"
                                         enable_libsrtp2=yes
                                         AM_CONDITIONAL([ENABLE_LIBSRTP_2], true)
                                         AC_CHECK_LIB([srtp2],
@@ -305,7 +417,7 @@ AM_COND_IF([ENABLE_LIBSRTP_2],
                          [
                            AC_CHECK_HEADER([srtp/srtp.h],
                                            [
-                                             JANUS_MANUAL_LIBS+=" -lsrtp"
+                                             JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -lsrtp"
                                              enable_libsrtp2=no
                                              PKG_CHECK_MODULES([SRTP15X],
                                                                [
@@ -327,7 +439,7 @@ AC_CHECK_LIB([usrsctp],
                AS_IF([test "x$enable_data_channels" != "xno"],
                [
                   AC_DEFINE(HAVE_SCTP)
-                  JANUS_MANUAL_LIBS+=" -lusrsctp"
+                  JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -lusrsctp"
                   enable_data_channels=yes
                ])
              ],
@@ -340,17 +452,17 @@ AM_CONDITIONAL([ENABLE_SCTP], [test "x$enable_data_channels" = "xyes"])
 PKG_CHECK_MODULES([LIBCURL],
                   [libcurl],
                   [
+                    AC_DEFINE(HAVE_LIBCURL)
+                    JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -lcurl"
                     AS_IF(
                       [test "x$enable_turn_rest_api" != "xno"],
                       [
-                        AC_DEFINE(HAVE_LIBCURL)
-                        JANUS_MANUAL_LIBS+=" -lcurl"
+                        AC_DEFINE(HAVE_TURNRESTAPI)
                         enable_turn_rest_api=yes
                       ])
                     AS_IF([test "x$enable_sample_event_handler" != "xno"],
                       [
                         AC_DEFINE(HAVE_SAMPLEEVH)
-                        JANUS_MANUAL_LIBS+=" -lcurl"
                         enable_sample_event_handler=yes
                       ])
                   ],
@@ -403,7 +515,7 @@ PKG_CHECK_MODULES([TRANSPORTS],
                   ])
 
 PKG_CHECK_MODULES([MHD],
-                  [libmicrohttpd],
+                  [libmicrohttpd >= 0.9.59],
                   [
                     AS_IF([test "x$enable_rest" = "xmaybe"],
                           [enable_rest=yes])
@@ -429,12 +541,18 @@ AC_CHECK_LIB([websockets],
 							   [AC_DEFINE(HAVE_LIBWEBSOCKETS_PEER_SIMPLE)]
 							  )
 			   ])
+               AS_IF([test "x$enable_websockets_event_handler" != "xno"],
+               [
+                 AC_DEFINE(HAVE_WSEVH)
+                 enable_websockets_event_handler=yes
+               ])
 			 ],
 			 [
 			   AS_IF([test "x$enable_websockets" = "xyes"],
 					 [AC_MSG_ERROR([libwebsockets not found. See README.md for installation instructions or use --disable-websockets])])
 			 ])
 AM_CONDITIONAL([ENABLE_WEBSOCKETS], [test "x$enable_websockets" = "xyes"])
+AM_CONDITIONAL([ENABLE_WSEVH], [test "x$enable_websockets_event_handler" = "xyes"])
 AC_SUBST(WS_MANUAL_LIBS)
 
 AC_CHECK_LIB([rabbitmq],
@@ -450,7 +568,6 @@ AC_CHECK_LIB([rabbitmq],
                  AC_DEFINE(HAVE_RABBITMQEVH)
                  enable_rabbitmq_event_handler=yes
                ])
-
              ],
              [
                AS_IF([test "x$enable_rabbitmq" = "xyes"],
@@ -466,10 +583,17 @@ AC_CHECK_LIB([paho-mqtt3a],
                   AC_DEFINE(HAVE_MQTT)
                   enable_mqtt=yes
                ])
+               AS_IF([test "x$enable_mqtt_event_handler" != "xno"],
+               [
+                 AC_DEFINE(HAVE_MQTTEVH)
+                 enable_mqtt_event_handler=yes
+               ])
              ],
              [
                AS_IF([test "x$enable_mqtt" = "xyes"],
                      [AC_MSG_ERROR([paho c client not found. See README.md for installation instructions or use --disable-mqtt])])
+               AS_IF([test "x$enable_mqtt_event_handler" = "xyes"],
+                     [AC_MSG_ERROR([paho c not found. See README.md for installation instructions or use --disable-mqtt-event-handler])])
              ])
 AC_CHECK_LIB([nanomsg],
              [nn_socket],
@@ -479,15 +603,26 @@ AC_CHECK_LIB([nanomsg],
                   AC_DEFINE(HAVE_NANOMSG)
                   enable_nanomsg=yes
                ])
+               AS_IF([test "x$enable_nanomsg_event_handler" != "xno"],
+               [
+                 AC_DEFINE(HAVE_NANOMSGEVH)
+                 enable_nanomsg_event_handler=yes
+               ])
              ],
              [
                AS_IF([test "x$enable_nanomsg" = "xyes"],
                      [AC_MSG_ERROR([nanomsg not found. See README.md for installation instructions or use --disable-nanomsg])])
+               AS_IF([test "x$enable_nanomsg_event_handler" = "xyes"],
+                     [AC_MSG_ERROR([nanomsg not found. See README.md for installation instructions or use --disable-nanomsg-event-handler])])
              ])
 AM_CONDITIONAL([ENABLE_RABBITMQ], [test "x$enable_rabbitmq" = "xyes"])
 AM_CONDITIONAL([ENABLE_RABBITMQEVH], [test "x$enable_rabbitmq_event_handler" = "xyes"])
 AM_CONDITIONAL([ENABLE_MQTT], [test "x$enable_mqtt" = "xyes"])
+AM_CONDITIONAL([ENABLE_MQTTEVH], [test "x$enable_mqtt_event_handler" = "xyes"])
 AM_CONDITIONAL([ENABLE_NANOMSG], [test "x$enable_nanomsg" = "xyes"])
+AM_CONDITIONAL([ENABLE_NANOMSGEVH], [test "x$enable_nanomsg_event_handler" = "xyes"])
+
+AM_CONDITIONAL([ENABLE_JSONLOGGER], [test "x$enable_json_logger" = "xyes"])
 
 AC_TRY_COMPILE([
                #include <stdlib.h>
@@ -521,7 +656,7 @@ AS_IF([test "x$enable_systemd_sockets" = "xyes"],
                           [AC_MSG_ERROR([libsystemd not found. systemd unix domain socket service not supported])])
       ])
 
- 
+
 ##
 # Plugins
 ##
@@ -540,11 +675,11 @@ AC_ARG_ENABLE([plugin-audiobridge],
               [enable_plugin_audiobridge=maybe])
 
 AC_ARG_ENABLE([plugin-duktape],
-              [AS_HELP_STRING([--disable-plugin-duktape],
-                              [Disable duktape plugin])],
+              [AS_HELP_STRING([--enable-plugin-duktape],
+                              [Enable duktape plugin])],
               [AS_IF([test "x$enable_plugin_duktape" != "xyes"],
                      [enable_plugin_duktape=no])],
-              [enable_plugin_duktape=yes])
+              [enable_plugin_duktape=no])
 
 AC_ARG_ENABLE([plugin-echotest],
               [AS_HELP_STRING([--disable-plugin-echotest],
@@ -554,11 +689,11 @@ AC_ARG_ENABLE([plugin-echotest],
               [enable_plugin_echotest=yes])
 
 AC_ARG_ENABLE([plugin-lua],
-              [AS_HELP_STRING([--disable-plugin-lua],
-                              [Disable lua plugin])],
+              [AS_HELP_STRING([--enable-plugin-lua],
+                              [Enable lua plugin])],
               [AS_IF([test "x$enable_plugin_lua" != "xyes"],
                      [enable_plugin_lua=no])],
-              [enable_plugin_lua=yes])
+              [enable_plugin_lua=no])
 
 AC_ARG_ENABLE([plugin-recordplay],
               [AS_HELP_STRING([--disable-plugin-recordplay],
@@ -573,13 +708,6 @@ AC_ARG_ENABLE([plugin-sip],
               [AS_IF([test "x$enable_plugin_sip" != "xyes"],
                      [enable_plugin_sip=no])],
               [enable_plugin_sip=maybe])
-
-AC_ARG_ENABLE([plugin-sipre],
-              [AS_HELP_STRING([--disable-plugin-sipre],
-                              [Disable sipre plugin])],
-              [AS_IF([test "x$enable_plugin_sipre" != "xyes"],
-                     [enable_plugin_sipre=no])],
-              [enable_plugin_sipre=maybe])
 
 AC_ARG_ENABLE([plugin-nosip],
               [AS_HELP_STRING([--disable-plugin-nosip],
@@ -636,41 +764,6 @@ PKG_CHECK_MODULES([SOFIA],
 AC_SUBST([SOFIA_CFLAGS])
 AC_SUBST([SOFIA_LIBS])
 
-PKG_CHECK_MODULES([LIBRE],
-                  [libre >= 0.5.7],
-                  [
-                    AS_IF([test "x$enable_plugin_sipre" = "xmaybe"],
-                          [
-                           enable_plugin_sipre=yes
-                           AC_DEFINE(HAVE_LIBRE_SIPREGNEWAPI)
-                           AC_CHECK_LIB([re],
-                                        [sip_set_trace],
-                                        [AC_DEFINE(HAVE_LIBRE_SIPTRACE)],
-                                        [AC_MSG_NOTICE([libre version does not have sip_set_trace])]
-                                       )
-                          ])
-                  ],
-                  [PKG_CHECK_MODULES([LIBRE],
-                                     [libre],
-                                     [
-                                      AS_IF([test "x$enable_plugin_sipre" = "xmaybe"],
-                                            [
-                                             enable_plugin_sipre=yes
-                                             AC_CHECK_LIB([re],
-                                                          [sip_set_trace],
-                                                          [AC_DEFINE(HAVE_LIBRE_SIPTRACE)],
-                                                          [AC_MSG_NOTICE([libre version does not have sip_set_trace])]
-                                                         )
-                                            ])
-                                     ],
-                                     [
-                                      AS_IF([test "x$enable_plugin_sipre" = "xyes"],
-                                            [AC_MSG_ERROR([libre not found. See README.md for installation instructions or use --disable-plugin-sip])])
-                                     ])
-                  ])
-AC_SUBST([SOFIA_CFLAGS])
-AC_SUBST([SOFIA_LIBS])
-
 PKG_CHECK_MODULES([OPUS],
                   [opus],
                   [
@@ -723,7 +816,6 @@ AM_CONDITIONAL([ENABLE_PLUGIN_ECHOTEST], [test "x$enable_plugin_echotest" = "xye
 AM_CONDITIONAL([ENABLE_PLUGIN_LUA], [test "x$enable_plugin_lua" = "xyes"])
 AM_CONDITIONAL([ENABLE_PLUGIN_RECORDPLAY], [test "x$enable_plugin_recordplay" = "xyes"])
 AM_CONDITIONAL([ENABLE_PLUGIN_SIP], [test "x$enable_plugin_sip" = "xyes"])
-AM_CONDITIONAL([ENABLE_PLUGIN_SIPRE], [test "x$enable_plugin_sipre" = "xyes"])
 AM_CONDITIONAL([ENABLE_PLUGIN_NOSIP], [test "x$enable_plugin_nosip" = "xyes"])
 AM_CONDITIONAL([ENABLE_PLUGIN_STREAMING], [test "x$enable_plugin_streaming" = "xyes"])
 AM_CONDITIONAL([ENABLE_PLUGIN_VIDEOCALL], [test "x$enable_plugin_videocall" = "xyes"])
@@ -737,6 +829,17 @@ AM_CONDITIONAL([ENABLE_PLUGIN_TEXTROOM], [test "x$enable_plugin_textroom" = "xye
 ##
 
 PKG_CHECK_MODULES([EVENTS],
+                  [
+                    glib-2.0 >= $glib_version
+                    jansson >= $jansson_version
+                  ])
+
+
+##
+# Loggers
+##
+
+PKG_CHECK_MODULES([LOGGERS],
                   [
                     glib-2.0 >= $glib_version
                     jansson >= $jansson_version
@@ -815,6 +918,7 @@ AS_IF([test "x$enable_post_processing" = "xyes"],
                            libavcodec
                            libavformat
                            ogg
+                           zlib
                          ])
       ])
 
@@ -835,7 +939,7 @@ AC_OUTPUT
 # Summary
 ##
 echo
-
+echo "Compiler:                  $CC"
 AM_COND_IF([ENABLE_LIBSRTP_2],
 	[echo "libsrtp version:           2.x"],
 	[echo "libsrtp version:           1.5.x"])
@@ -849,6 +953,9 @@ AM_COND_IF([ENABLE_BORINGSSL],
 		[echo "SSL/crypto library:        LibreSSL"],
 		[echo "SSL/crypto library:        OpenSSL"])
 	 echo "DTLS set-timeout:          not available"])
+AM_COND_IF([ENABLE_PTHREAD_MUTEX],
+	[echo "Mutex implementation:      pthread mutex"],
+	[echo "Mutex implementation:      GMutex (native futex on Linux)"])
 AM_COND_IF([ENABLE_SCTP],
 	[echo "DataChannels support:      yes"],
 	[echo "DataChannels support:      no"])
@@ -891,11 +998,8 @@ AM_COND_IF([ENABLE_PLUGIN_VIDEOCALL],
 	[echo "    Video Call:            yes"],
 	[echo "    Video Call:            no"])
 AM_COND_IF([ENABLE_PLUGIN_SIP],
-	[echo "    SIP Gateway (Sofia):   yes"],
-	[echo "    SIP Gateway (Sofia):   no"])
-AM_COND_IF([ENABLE_PLUGIN_SIPRE],
-	[echo "    SIP Gateway (libre):   yes"],
-	[echo "    SIP Gateway (libre):   no"])
+	[echo "    SIP Gateway:           yes"],
+	[echo "    SIP Gateway:           no"])
 AM_COND_IF([ENABLE_PLUGIN_NOSIP],
 	[echo "    NoSIP (RTP Bridge):    yes"],
 	[echo "    NoSIP (RTP Bridge):    no"])
@@ -924,9 +1028,22 @@ echo "Event handlers:"
 AM_COND_IF([ENABLE_SAMPLEEVH],
 	[echo "    Sample event handler:  yes"],
 	[echo "    Sample event handler:  no"])
+AM_COND_IF([ENABLE_WSEVH],
+	[echo "    WebSocket ev. handler: yes"],
+	[echo "    WebSocket ev. handler: no"])
 AM_COND_IF([ENABLE_RABBITMQEVH],
 	[echo "    RabbitMQ event handler:yes"],
 	[echo "    RabbitMQ event handler:no"])
+AM_COND_IF([ENABLE_MQTTEVH],
+	[echo "    MQTT event handler:    yes"],
+	[echo "    MQTT event handler:    no"])
+AM_COND_IF([ENABLE_NANOMSGEVH],
+	[echo "    Nanomsg event handler: yes"],
+	[echo "    Nanomsg event handler: no"])
+echo "External loggers:"
+AM_COND_IF([ENABLE_JSONLOGGER],
+	[echo "    JSON file logger:      yes"],
+	[echo "    JSON file logger:      no"])
 AM_COND_IF([ENABLE_JAVASCRIPT_MODULES], [
 	echo "JavaScript modules:        yes"
 	echo "    Using npm:             $NPM"

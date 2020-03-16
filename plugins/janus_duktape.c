@@ -30,7 +30,7 @@
  *
  * Every JavaScript script that wants to implement a Janus plugin must provide
  * the following functions as callbacks:
- * 
+ *
  * - \c init(): called when janus_duktape.c is initialized;
  * - \c destroy(): called when janus_duktape.c is deinitialized (Janus shutting down);
  * - \c createSession(): called when a new user attaches to the Janus Duktape plugin;
@@ -53,9 +53,10 @@
  *
  * \note Notice that, along the above mentioned callbacks, JavaScript scripts
  * can also implement functions like \c incomingRtp() \c incomingRtcp()
- * and \c incomingData() to handle those packets directly, instead of
- * letting the C code worry about relaying/processing them. While it might
- * make sense to handle incoming data channel messages with \c incomingData()
+ * \c incomingTextData() and \c incomingBinaryData() to handle those packets
+ * directly, instead of letting the C code worry about relaying/processing
+ * them. While it might make sense to handle incoming data channel messages
+ * with \c incomingTextData() or \c incomingBinaryData
  * though, the performance impact of directly processing and manipulating
  * RTP an RTCP packets is probably too high, and so their usage is currently
  * discouraged. As an additional note, JavaScript scripts can also decide to
@@ -65,6 +66,10 @@
  * the JavaScript plugin will return its own info (i.e., "janus.plugin.javascript", etc.).
  * Most of the times, JavaScript scripts will not need to override this information,
  * unless they really want to register their own name spaces and versioning.
+ * Finally, JavaScript scripts can receive information on slow links via the
+ * \c slowLink() callback, in order to react accordingly: e.g., reduce
+ * the bitrate of a video sender if they, or their viewers, are experiencing
+ * issues.
  *
  * \section dtcapi C interfaces
  *
@@ -97,7 +102,7 @@
  * and, more importantly, both \c timeCallback() and \c pokeScheduler() which,
  * together with JavaScript's \c resumeScheduler(), will be clearer in the next section.
  *
- * \section coroutines JavaScript/C coroutines scheduler
+ * \section jcoroutines JavaScript/C coroutines scheduler
  *
  * Duktape is a single threaded environment. While it has a concept similar
  * to threads called coroutines, these are not threads as known in C.
@@ -125,7 +130,7 @@
  * This simple mechanism is what the sample JavaScript scripts provided in this
  * repo use, for instance, to handle incoming messages asynchronously,
  * so you can refer to those to have an idea of how it can be used. The
- * next section will address \ref timers instead.
+ * next section will address \ref jtimers instead.
  *
  * \note You can implement asynchronous behaviour any way you want, and
  * you're not required to use this C scheduler. Anyway, you must implement
@@ -133,7 +138,7 @@
  * its presence and fails if it's not there. If you don't need it, just
  * create an empty function that does nothing and you'll be fine.
  *
- * \section timers JavaScript/C time-based scheduler
+ * \section jtimers JavaScript/C time-based scheduler
  *
  * Another helpful way to implement asynchronous behaviour is with the
  * help of the \c timeCallback() function. Specifically, this function
@@ -207,10 +212,11 @@ const char *janus_duktape_get_author(void);
 const char *janus_duktape_get_package(void);
 void janus_duktape_create_session(janus_plugin_session *handle, int *error);
 struct janus_plugin_result *janus_duktape_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep);
+json_t *janus_duktape_handle_admin_message(json_t *message);
 void janus_duktape_setup_media(janus_plugin_session *handle);
-void janus_duktape_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len);
-void janus_duktape_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len);
-void janus_duktape_incoming_data(janus_plugin_session *handle, char *buf, int len);
+void janus_duktape_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *packet);
+void janus_duktape_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet);
+void janus_duktape_incoming_data(janus_plugin_session *handle, janus_plugin_data *packet);
 void janus_duktape_slow_link(janus_plugin_session *handle, int uplink, int video);
 void janus_duktape_hangup_media(janus_plugin_session *handle);
 void janus_duktape_destroy_session(janus_plugin_session *handle, int *error);
@@ -229,9 +235,10 @@ static janus_plugin janus_duktape_plugin =
 		.get_name = janus_duktape_get_name,
 		.get_author = janus_duktape_get_author,
 		.get_package = janus_duktape_get_package,
-		
+
 		.create_session = janus_duktape_create_session,
 		.handle_message = janus_duktape_handle_message,
+		.handle_admin_message = janus_duktape_handle_admin_message,
 		.setup_media = janus_duktape_setup_media,
 		.incoming_rtp = janus_duktape_incoming_rtp,
 		.incoming_rtcp = janus_duktape_incoming_rtcp,
@@ -276,9 +283,13 @@ static gboolean has_get_author = FALSE;
 static char *duktape_script_author = NULL;
 static gboolean has_get_package = FALSE;
 static char *duktape_script_package = NULL;
+static gboolean has_handle_admin_message = FALSE;
 static gboolean has_incoming_rtp = FALSE;
 static gboolean has_incoming_rtcp = FALSE;
-static gboolean has_incoming_data = FALSE;
+static gboolean has_incoming_data_legacy = FALSE,	/* Legacy callback */
+	has_incoming_text_data = FALSE,
+	has_incoming_binary_data = FALSE;
+static gboolean has_slow_link = FALSE;
 /* JavaScript C scheduler (for coroutines) */
 static GThread *scheduler_thread = NULL;
 static void *janus_duktape_scheduler(void *data);
@@ -304,8 +315,8 @@ typedef struct janus_duktape_callback {
 
 /* Helper function to sample the number of occupied slots into JavaScript stack */
 static void janus_duktape_stackdump(duk_context *ctx) {
-    int top = duk_get_top(ctx);
-    JANUS_LOG(LOG_HUGE, "Total in Duktape stack: %d\n", top);
+	int top = duk_get_top(ctx);
+	JANUS_LOG(LOG_HUGE, "Total in Duktape stack: %d\n", top);
 }
 
 /* janus_duktape_session is defined in janus_duktape_data.h, but it's managed here */
@@ -334,9 +345,12 @@ static void janus_duktape_session_free(const janus_refcount *session_ref) {
 typedef struct janus_duktape_rtp_relay_packet {
 	rtp_header *data;
 	gint length;
+	gboolean is_rtp;	/* This may be a data packet and not RTP */
 	gboolean is_video;
 	uint32_t timestamp;
 	uint16_t seq_number;
+	/* The following is only relevant for datachannels */
+	gboolean textdata;
 } janus_duktape_rtp_relay_packet;
 static void janus_duktape_relay_rtp_packet(gpointer data, gpointer user_data);
 static void janus_duktape_relay_data_packet(gpointer data, gpointer user_data);
@@ -402,6 +416,11 @@ static duk_ret_t janus_duktape_method_getmodulesfolder(duk_context *ctx) {
 	return 1;
 }
 
+static duk_ret_t janus_duktape_method_getversion(duk_context *ctx) {
+	duk_push_int(ctx, DUK_VERSION);
+	return 1;
+}
+
 static duk_ret_t janus_duktape_method_readfile(duk_context *ctx) {
 	/* Helper method to read a text file and return its content as a string */
 	if(duk_get_type(ctx, 0) != DUK_TYPE_STRING) {
@@ -417,12 +436,17 @@ static duk_ret_t janus_duktape_method_readfile(duk_context *ctx) {
 	}
 	fseek(f, 0, SEEK_END);
 	int len = (int)ftell(f);
+	if(len < 0) {
+		duk_push_error_object(ctx, DUK_ERR_ERROR, "Error opening file: %s\n", strerror(errno));
+		return duk_throw(ctx);
+	}
 	fseek(f, 0, SEEK_SET);
 	char *text = g_malloc(len);
 	size_t offset = 0, r = 0, t = len;
 	while(t > 0) {
 		r = fread(text+offset, 1, t, f);
 		if(r == 0) {
+			fclose(f);
 			g_free(text);
 			duk_push_error_object(ctx, DUK_ERR_ERROR, "Error reading file: %s\n", filename);
 			return duk_throw(ctx);
@@ -430,6 +454,7 @@ static duk_ret_t janus_duktape_method_readfile(duk_context *ctx) {
 		t -= r;
 	}
 	duk_push_lstring(ctx, text, len);
+	fclose(f);
 	g_free(text);
 	return 1;
 }
@@ -483,7 +508,8 @@ static duk_ret_t janus_duktape_method_pushevent(duk_context *ctx) {
 			janus_duktape_type_string(DUK_TYPE_NUMBER), janus_duktape_type_string(duk_get_type(ctx, 0)));
 		return duk_throw(ctx);
 	}
-	if(duk_get_type(ctx, 1) != DUK_TYPE_STRING && duk_get_type(ctx, 1) != DUK_TYPE_UNDEFINED) {
+	if(duk_get_type(ctx, 1) != DUK_TYPE_STRING &&
+			duk_get_type(ctx, 1) != DUK_TYPE_UNDEFINED && duk_get_type(ctx, 1) != DUK_TYPE_NULL) {
 		duk_push_error_object(ctx, DUK_RET_TYPE_ERROR, "Invalid argument (expected %s, got %s)\n",
 			janus_duktape_type_string(DUK_TYPE_STRING), janus_duktape_type_string(duk_get_type(ctx, 1)));
 		return duk_throw(ctx);
@@ -493,7 +519,8 @@ static duk_ret_t janus_duktape_method_pushevent(duk_context *ctx) {
 			janus_duktape_type_string(DUK_TYPE_STRING), janus_duktape_type_string(duk_get_type(ctx, 2)));
 		return duk_throw(ctx);
 	}
-	if(duk_get_type(ctx, 3) != DUK_TYPE_STRING && duk_get_type(ctx, 3) != DUK_TYPE_UNDEFINED) {
+	if(duk_get_type(ctx, 3) != DUK_TYPE_STRING &&
+			duk_get_type(ctx, 3) != DUK_TYPE_UNDEFINED && duk_get_type(ctx, 3) != DUK_TYPE_NULL) {
 		duk_push_error_object(ctx, DUK_RET_TYPE_ERROR, "Invalid argument (expected %s, got %s)\n",
 			janus_duktape_type_string(DUK_TYPE_STRING), janus_duktape_type_string(duk_get_type(ctx, 3)));
 		return duk_throw(ctx);
@@ -848,10 +875,9 @@ static duk_ret_t janus_duktape_method_setbitrate(duk_context *ctx) {
 	janus_mutex_unlock(&duktape_sessions_mutex);
 	session->bitrate = bitrate;
 	/* Send a REMB right away too, if the PeerConnection is up */
-	if(session->bitrate > 0 && g_atomic_int_get(&session->started)) {
-		char rtcpbuf[24];
-		janus_rtcp_remb((char *)(&rtcpbuf), 24, session->bitrate);
-		janus_core->relay_rtcp(session->handle, 1, rtcpbuf, 24);
+	if(g_atomic_int_get(&session->started)) {
+		/* No limit ~= 10000000 */
+		janus_core->send_remb(session->handle, session->bitrate ? session->bitrate : 10000000);
 	}
 	/* Done */
 	janus_refcount_decrease(&session->ref);
@@ -907,10 +933,8 @@ static duk_ret_t janus_duktape_method_sendpli(duk_context *ctx) {
 	janus_mutex_unlock(&duktape_sessions_mutex);
 	/* Send a PLI */
 	session->pli_latest = janus_get_monotonic_time();
-	char rtcpbuf[12];
-	janus_rtcp_pli((char *)&rtcpbuf, 12);
 	JANUS_LOG(LOG_HUGE, "Sending PLI to session %"SCNu32"\n", session->id);
-	janus_core->relay_rtcp(session->handle, 1, rtcpbuf, 12);
+	janus_core->send_pli(session->handle);
 	/* Done */
 	janus_refcount_decrease(&session->ref);
 	duk_push_int(ctx, 0);
@@ -957,7 +981,9 @@ static duk_ret_t janus_duktape_method_relayrtp(duk_context *ctx) {
 	}
 	janus_mutex_unlock(&duktape_sessions_mutex);
 	/* Send the RTP packet */
-	janus_core->relay_rtp(session->handle, is_video, (char *)payload, len);
+	janus_plugin_rtp rtp = { .video = is_video, .buffer = (char *)payload, .length = len };
+	janus_plugin_rtp_extensions_reset(&rtp.extensions);
+	janus_core->relay_rtp(session->handle, &rtp);
 	duk_push_int(ctx, 0);
 	return 1;
 }
@@ -1002,12 +1028,13 @@ static duk_ret_t janus_duktape_method_relayrtcp(duk_context *ctx) {
 	}
 	janus_mutex_unlock(&duktape_sessions_mutex);
 	/* Send the RTCP packet */
-	janus_core->relay_rtcp(session->handle, is_video, (char *)payload, len);
+	janus_plugin_rtcp rtcp = { .video = is_video, .buffer = (char *)payload, .length = len };
+	janus_core->relay_rtcp(session->handle, &rtcp);
 	duk_push_int(ctx, 0);
 	return 1;
 }
 
-static duk_ret_t janus_duktape_method_relaydata(duk_context *ctx) {
+static duk_ret_t janus_duktape_method_relaytextdata(duk_context *ctx) {
 	if(duk_get_type(ctx, 0) != DUK_TYPE_NUMBER) {
 		duk_push_error_object(ctx, DUK_RET_TYPE_ERROR, "Invalid argument (expected %s, got %s)\n",
 			janus_duktape_type_string(DUK_TYPE_NUMBER), janus_duktape_type_string(duk_get_type(ctx, 0)));
@@ -1023,6 +1050,7 @@ static duk_ret_t janus_duktape_method_relaydata(duk_context *ctx) {
 			janus_duktape_type_string(DUK_TYPE_NUMBER), janus_duktape_type_string(duk_get_type(ctx, 2)));
 		return duk_throw(ctx);
 	}
+	/* FIXME We should add support for labels, here */
 	uint32_t id = (uint32_t)duk_get_number(ctx, 0);
 	const char *payload = duk_get_string(ctx, 1);
 	int len = (int)duk_get_number(ctx, 2);
@@ -1041,11 +1069,59 @@ static duk_ret_t janus_duktape_method_relaydata(duk_context *ctx) {
 	}
 	janus_refcount_increase(&session->ref);
 	janus_mutex_unlock(&duktape_sessions_mutex);
-	/* Send the RTP packet */
-	janus_core->relay_data(session->handle, (char *)payload, len);
+	/* Send the data */
+	janus_plugin_data data = { .label = NULL, .binary = FALSE, .buffer = (char *)payload, .length = len };
+	janus_core->relay_data(session->handle, &data);
 	janus_refcount_decrease(&session->ref);
 	duk_push_int(ctx, 0);
 	return 1;
+}
+
+static duk_ret_t janus_duktape_method_relaybinarydata(duk_context *ctx) {
+	if(duk_get_type(ctx, 0) != DUK_TYPE_NUMBER) {
+		duk_push_error_object(ctx, DUK_RET_TYPE_ERROR, "Invalid argument (expected %s, got %s)\n",
+			janus_duktape_type_string(DUK_TYPE_NUMBER), janus_duktape_type_string(duk_get_type(ctx, 0)));
+		return duk_throw(ctx);
+	}
+	if(duk_get_type(ctx, 1) != DUK_TYPE_STRING) {
+		duk_push_error_object(ctx, DUK_RET_TYPE_ERROR, "Invalid argument (expected %s, got %s)\n",
+			janus_duktape_type_string(DUK_TYPE_STRING), janus_duktape_type_string(duk_get_type(ctx, 1)));
+		return duk_throw(ctx);
+	}
+	if(duk_get_type(ctx, 2) != DUK_TYPE_NUMBER) {
+		duk_push_error_object(ctx, DUK_RET_TYPE_ERROR, "Invalid argument (expected %s, got %s)\n",
+			janus_duktape_type_string(DUK_TYPE_NUMBER), janus_duktape_type_string(duk_get_type(ctx, 2)));
+		return duk_throw(ctx);
+	}
+	uint32_t id = (uint32_t)duk_get_number(ctx, 0);
+	/* FIXME We should add support for labels, here */
+	const char *payload = duk_get_string(ctx, 1);
+	int len = (int)duk_get_number(ctx, 2);
+	if(payload == NULL || len < 1) {
+		JANUS_LOG(LOG_ERR, "Invalid data\n");
+		duk_push_error_object(ctx, DUK_ERR_ERROR, "Invalid payload of declared size %d", len);
+		return duk_throw(ctx);
+	}
+	/* Find the session */
+	janus_mutex_lock(&duktape_sessions_mutex);
+	janus_duktape_session *session = g_hash_table_lookup(duktape_ids, GUINT_TO_POINTER(id));
+	if(session == NULL || g_atomic_int_get(&session->destroyed)) {
+		janus_mutex_unlock(&duktape_sessions_mutex);
+		duk_push_error_object(ctx, DUK_ERR_ERROR, "Session %"SCNu32" doesn't exist", id);
+		return duk_throw(ctx);
+	}
+	janus_refcount_increase(&session->ref);
+	janus_mutex_unlock(&duktape_sessions_mutex);
+	janus_plugin_data data = { .label = NULL, .binary = TRUE, .buffer = (char *)payload, .length = len };
+	janus_core->relay_data(session->handle, &data);
+	janus_refcount_decrease(&session->ref);
+	duk_push_int(ctx, 0);
+	return 1;
+}
+
+static int janus_duktape_method_relaydata(duk_context *ctx) {
+	JANUS_LOG(LOG_WARN, "Deprecated function 'relayData' called, invoking 'relayTextData' instead\n");
+	return janus_duktape_method_relaytextdata(ctx);
 }
 
 static duk_ret_t janus_duktape_method_startrecording(duk_context *ctx) {
@@ -1114,10 +1190,8 @@ static duk_ret_t janus_duktape_method_startrecording(duk_context *ctx) {
 		session->vrc = vrc;
 		/* Also send a keyframe request */
 		session->pli_latest = janus_get_monotonic_time();
-		char rtcpbuf[12];
-		janus_rtcp_pli((char *)&rtcpbuf, 12);
 		JANUS_LOG(LOG_HUGE, "Sending PLI to session %"SCNu32"\n", session->id);
-		janus_core->relay_rtcp(session->handle, 1, rtcpbuf, 12);
+		janus_core->send_pli(session->handle);
 	}
 	if(drc) {
 		session->drc = drc;
@@ -1213,19 +1287,26 @@ int janus_duktape_init(janus_callbacks *callback, const char *config_path) {
 
 	/* Read configuration */
 	char filename[255];
-	g_snprintf(filename, 255, "%s/%s.cfg", config_path, JANUS_DUKTAPE_PACKAGE);
+	g_snprintf(filename, 255, "%s/%s.jcfg", config_path, JANUS_DUKTAPE_PACKAGE);
 	JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
 	janus_config *config = janus_config_parse(filename);
+	if(config == NULL) {
+		JANUS_LOG(LOG_WARN, "Couldn't find .jcfg configuration file (%s), trying .cfg\n", JANUS_DUKTAPE_PACKAGE);
+		g_snprintf(filename, 255, "%s/%s.cfg", config_path, JANUS_DUKTAPE_PACKAGE);
+		JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
+		config = janus_config_parse(filename);
+	}
 	if(config == NULL) {
 		/* No config means no JS script */
 		JANUS_LOG(LOG_ERR, "Failed to load configuration file for Duktape plugin...\n");
 		return -1;
 	}
 	janus_config_print(config);
-	janus_config_item *folder = janus_config_get_item_drilldown(config, "general", "path");
+	janus_config_category *config_general = janus_config_get_create(config, NULL, janus_config_type_category, "general");
+	janus_config_item *folder = janus_config_get(config, config_general, janus_config_type_item, "path");
 	if(folder && folder->value)
 		duktape_folder = g_strdup(folder->value);
-	janus_config_item *script = janus_config_get_item_drilldown(config, "general", "script");
+	janus_config_item *script = janus_config_get(config, config_general, janus_config_type_item, "script");
 	if(script == NULL || script->value == NULL) {
 		JANUS_LOG(LOG_ERR, "Missing script path in Duktape plugin configuration...\n");
 		janus_config_destroy(config);
@@ -1234,7 +1315,7 @@ int janus_duktape_init(janus_callbacks *callback, const char *config_path) {
 	}
 	char *duktape_file = g_strdup(script->value);
 	char *duktape_config = NULL;
-	janus_config_item *conf = janus_config_get_item_drilldown(config, "general", "config");
+	janus_config_item *conf = janus_config_get(config, config_general, janus_config_type_item, "config");
 	if(conf && conf->value)
 		duktape_config = g_strdup(conf->value);
 	janus_config_destroy(config);
@@ -1284,28 +1365,46 @@ int janus_duktape_init(janus_callbacks *callback, const char *config_path) {
 	duk_put_global_string(duktape_ctx, "relayRtp");
 	duk_push_c_function(duktape_ctx, janus_duktape_method_relayrtcp, 4);
 	duk_put_global_string(duktape_ctx, "relayRtcp");
-	duk_push_c_function(duktape_ctx, janus_duktape_method_relaydata, 3);
+	duk_push_c_function(duktape_ctx, janus_duktape_method_relaydata, 3);	/* Legacy function, deprecated */
 	duk_put_global_string(duktape_ctx, "relayData");
+	duk_push_c_function(duktape_ctx, janus_duktape_method_relaytextdata, 3);
+	duk_put_global_string(duktape_ctx, "relayTextData");
+	duk_push_c_function(duktape_ctx, janus_duktape_method_relaybinarydata, 3);
+	duk_put_global_string(duktape_ctx, "relayBinaryData");
 	duk_push_c_function(duktape_ctx, janus_duktape_method_startrecording, 13);
 	duk_put_global_string(duktape_ctx, "startRecording");
 	duk_push_c_function(duktape_ctx, janus_duktape_method_stoprecording, 4);
 	duk_put_global_string(duktape_ctx, "stopRecording");
+	duk_push_c_function(duktape_ctx, janus_duktape_method_getversion, 0);
+	duk_put_global_string(duktape_ctx, "getDuktapeVersion");
 	/* Register all extra functions, if any were added */
 	janus_duktape_register_extra_functions(duktape_ctx);
 
 	/* Now load the script (FIXME badly) */
-    FILE *f = fopen(duktape_file, "rb");
-    if(f == NULL) {
+	FILE *f = fopen(duktape_file, "rb");
+	if(f == NULL) {
 		JANUS_LOG(LOG_ERR, "Error loading JS script %s: no such file\n", duktape_file);
 		duk_destroy_heap(duktape_ctx);
 		g_free(duktape_folder);
 		g_free(duktape_file);
 		return -1;
 	}
-    char buf[16384];
-    size_t len = fread((void *) buf, 1, sizeof(buf), f);
+	fseek(f, 0, SEEK_END);
+	size_t len = ftell(f);
+	if(len < 1) {
+		JANUS_LOG(LOG_ERR, "Error loading JS script %s: empty file\n", duktape_file);
+		fclose(f);
+		duk_destroy_heap(duktape_ctx);
+		g_free(duktape_folder);
+		g_free(duktape_file);
+		return -1;
+	}
+	char *buf = (char *)g_malloc0(len);
+	fseek(f, 0, SEEK_SET);
+	fread((void *)buf, 1, len, f);
 	fclose(f);
 	duk_push_lstring(duktape_ctx, (const char *)buf, (duk_size_t)len);
+	g_free(buf);
 	if(duk_peval(duktape_ctx) != 0) {
 		JANUS_LOG(LOG_ERR, "Error loading JS script %s: %s\n", duktape_file, duk_safe_to_string(duktape_ctx, -1));
 		duk_destroy_heap(duktape_ctx);
@@ -1347,6 +1446,9 @@ int janus_duktape_init(janus_callbacks *callback, const char *config_path) {
 	duk_get_global_string(duktape_ctx, "getPackage");
 	if(duk_is_function(duktape_ctx, duk_get_top(duktape_ctx)-1) != 0)
 		has_get_package = TRUE;
+	duk_get_global_string(duktape_ctx, "handleAdminMessage");
+	if(duk_is_function(duktape_ctx, duk_get_top(duktape_ctx)-1) != 0)
+		has_handle_admin_message = TRUE;
 	duk_get_global_string(duktape_ctx, "incomingRtp");
 	if(duk_is_function(duktape_ctx, duk_get_top(duktape_ctx)-1) != 0)
 		has_incoming_rtp = TRUE;
@@ -1354,8 +1456,20 @@ int janus_duktape_init(janus_callbacks *callback, const char *config_path) {
 	if(duk_is_function(duktape_ctx, duk_get_top(duktape_ctx)-1) != 0)
 		has_incoming_rtcp = TRUE;
 	duk_get_global_string(duktape_ctx, "incomingData");
+	if(duk_is_function(duktape_ctx, duk_get_top(duktape_ctx)-1) != 0) {
+		has_incoming_data_legacy = TRUE;
+		JANUS_LOG(LOG_WARN, "The Duktape script contains the deprecated 'incomingData' callback: update it "
+			"to use 'incomingTextData' and/or 'incomingBinaryData' in the future (see PR #1878)\n");
+	}
+	duk_get_global_string(duktape_ctx, "incomingTextData");
 	if(duk_is_function(duktape_ctx, duk_get_top(duktape_ctx)-1) != 0)
-		has_incoming_data = TRUE;
+		has_incoming_text_data = TRUE;
+	duk_get_global_string(duktape_ctx, "incomingBinaryData");
+	if(duk_is_function(duktape_ctx, duk_get_top(duktape_ctx)-1) != 0)
+		has_incoming_binary_data = TRUE;
+	duk_get_global_string(duktape_ctx, "slowLink");
+	if(duk_is_function(duktape_ctx, duk_get_top(duktape_ctx)-1) != 0)
+		has_slow_link = TRUE;
 
 	duktape_sessions = g_hash_table_new_full(NULL, NULL, NULL, (GDestroyNotify)janus_duktape_session_destroy);
 	duktape_ids = g_hash_table_new(NULL, NULL);
@@ -1395,7 +1509,7 @@ int janus_duktape_init(janus_callbacks *callback, const char *config_path) {
 		return -1;
 	}
 
-	/* This is the callback we'll need to invoke to contact the gateway */
+	/* This is the callback we'll need to invoke to contact the Janus core */
 	janus_core = callback;
 
 	/* Init the JS script, in case it's needed */
@@ -1495,12 +1609,11 @@ int janus_duktape_get_version(void) {
 	/* Check if the JS script wants to override this method and return info itself */
 	if(has_get_version) {
 		/* Yep, pass the request to the JS script and return the info */
-		janus_mutex_lock(&duktape_mutex);
-		/* Unless we asked already */
 		if(duktape_script_version != -1) {
-			janus_mutex_unlock(&duktape_mutex);
+			/* Unless we asked already */
 			return duktape_script_version;
 		}
+		janus_mutex_lock(&duktape_mutex);
 		duk_idx_t thr_idx = duk_push_thread(duktape_ctx);
 		duk_context *t = duk_get_context(duktape_ctx, thr_idx);
 		duk_get_global_string(t, "getVersion");
@@ -1509,11 +1622,13 @@ int janus_duktape_get_version(void) {
 			/* Something went wrong... return the Janus Duktape plugin info */
 			JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 			duk_pop(t);
+			duk_pop(duktape_ctx);
 			janus_mutex_unlock(&duktape_mutex);
 			return JANUS_DUKTAPE_VERSION;
 		}
 		duktape_script_version = (int)duk_get_number(t, -1);
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		return duktape_script_version;
 	}
@@ -1525,12 +1640,11 @@ const char *janus_duktape_get_version_string(void) {
 	/* Check if the JS script wants to override this method and return info itself */
 	if(has_get_version_string) {
 		/* Yep, pass the request to the JS script and return the info */
-		janus_mutex_lock(&duktape_mutex);
-		/* Unless we asked already */
 		if(duktape_script_version_string != NULL) {
-			janus_mutex_unlock(&duktape_mutex);
+			/* Unless we asked already */
 			return duktape_script_version_string;
 		}
+		janus_mutex_lock(&duktape_mutex);
 		duk_idx_t thr_idx = duk_push_thread(duktape_ctx);
 		duk_context *t = duk_get_context(duktape_ctx, thr_idx);
 		duk_get_global_string(t, "getVersionString");
@@ -1539,6 +1653,7 @@ const char *janus_duktape_get_version_string(void) {
 			/* Something went wrong... return the Janus Duktape plugin info */
 			JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 			duk_pop(t);
+			duk_pop(duktape_ctx);
 			janus_mutex_unlock(&duktape_mutex);
 			return JANUS_DUKTAPE_VERSION_STRING;
 		}
@@ -1546,6 +1661,7 @@ const char *janus_duktape_get_version_string(void) {
 		if(version != NULL)
 			duktape_script_version_string = g_strdup(version);
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		return duktape_script_version_string;
 	}
@@ -1557,12 +1673,11 @@ const char *janus_duktape_get_description(void) {
 	/* Check if the JS script wants to override this method and return info itself */
 	if(has_get_description) {
 		/* Yep, pass the request to the JS script and return the info */
-		janus_mutex_lock(&duktape_mutex);
-		/* Unless we asked already */
 		if(duktape_script_description != NULL) {
-			janus_mutex_unlock(&duktape_mutex);
+			/* Unless we asked already */
 			return duktape_script_description;
 		}
+		janus_mutex_lock(&duktape_mutex);
 		duk_idx_t thr_idx = duk_push_thread(duktape_ctx);
 		duk_context *t = duk_get_context(duktape_ctx, thr_idx);
 		duk_get_global_string(t, "getDescription");
@@ -1571,6 +1686,7 @@ const char *janus_duktape_get_description(void) {
 			/* Something went wrong... return the Janus Duktape plugin info */
 			JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 			duk_pop(t);
+			duk_pop(duktape_ctx);
 			janus_mutex_unlock(&duktape_mutex);
 			return JANUS_DUKTAPE_DESCRIPTION;
 		}
@@ -1578,6 +1694,7 @@ const char *janus_duktape_get_description(void) {
 		if(description != NULL)
 			duktape_script_description = g_strdup(description);
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		return duktape_script_description;
 	}
@@ -1589,12 +1706,11 @@ const char *janus_duktape_get_name(void) {
 	/* Check if the JS script wants to override this method and return info itself */
 	if(has_get_name) {
 		/* Yep, pass the request to the JS script and return the info */
-		janus_mutex_lock(&duktape_mutex);
-		/* Unless we asked already */
 		if(duktape_script_name != NULL) {
-			janus_mutex_unlock(&duktape_mutex);
+			/* Unless we asked already */
 			return duktape_script_name;
 		}
+		janus_mutex_lock(&duktape_mutex);
 		duk_idx_t thr_idx = duk_push_thread(duktape_ctx);
 		duk_context *t = duk_get_context(duktape_ctx, thr_idx);
 		duk_get_global_string(t, "getName");
@@ -1603,6 +1719,7 @@ const char *janus_duktape_get_name(void) {
 			/* Something went wrong... return the Janus Duktape plugin info */
 			JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 			duk_pop(t);
+			duk_pop(duktape_ctx);
 			janus_mutex_unlock(&duktape_mutex);
 			return JANUS_DUKTAPE_NAME;
 		}
@@ -1610,6 +1727,7 @@ const char *janus_duktape_get_name(void) {
 		if(name != NULL)
 			duktape_script_name = g_strdup(name);
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		return duktape_script_name;
 	}
@@ -1621,12 +1739,11 @@ const char *janus_duktape_get_author(void) {
 	/* Check if the JS script wants to override this method and return info itself */
 	if(has_get_author) {
 		/* Yep, pass the request to the JS script and return the info */
-		janus_mutex_lock(&duktape_mutex);
-		/* Unless we asked already */
 		if(duktape_script_author != NULL) {
-			janus_mutex_unlock(&duktape_mutex);
+			/* Unless we asked already */
 			return duktape_script_author;
 		}
+		janus_mutex_lock(&duktape_mutex);
 		duk_idx_t thr_idx = duk_push_thread(duktape_ctx);
 		duk_context *t = duk_get_context(duktape_ctx, thr_idx);
 		duk_get_global_string(t, "getAuthor");
@@ -1635,6 +1752,7 @@ const char *janus_duktape_get_author(void) {
 			/* Something went wrong... return the Janus Duktape plugin info */
 			JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 			duk_pop(t);
+			duk_pop(duktape_ctx);
 			janus_mutex_unlock(&duktape_mutex);
 			return JANUS_DUKTAPE_AUTHOR;
 		}
@@ -1642,6 +1760,7 @@ const char *janus_duktape_get_author(void) {
 		if(author != NULL)
 			duktape_script_author = g_strdup(author);
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		return duktape_script_author;
 	}
@@ -1653,12 +1772,11 @@ const char *janus_duktape_get_package(void) {
 	/* Check if the JS script wants to override this method and return info itself */
 	if(has_get_package) {
 		/* Yep, pass the request to the JS script and return the info */
-		janus_mutex_lock(&duktape_mutex);
-		/* Unless we asked already */
 		if(duktape_script_package != NULL) {
-			janus_mutex_unlock(&duktape_mutex);
+			/* Unless we asked already */
 			return duktape_script_package;
 		}
+		janus_mutex_lock(&duktape_mutex);
 		duk_idx_t thr_idx = duk_push_thread(duktape_ctx);
 		duk_context *t = duk_get_context(duktape_ctx, thr_idx);
 		duk_get_global_string(t, "getPackage");
@@ -1667,6 +1785,7 @@ const char *janus_duktape_get_package(void) {
 			/* Something went wrong... return the Janus Duktape plugin info */
 			JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 			duk_pop(t);
+			duk_pop(duktape_ctx);
 			janus_mutex_unlock(&duktape_mutex);
 			return JANUS_DUKTAPE_PACKAGE;
 		}
@@ -1674,6 +1793,7 @@ const char *janus_duktape_get_package(void) {
 		if(package != NULL)
 			duktape_script_package = g_strdup(package);
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		return duktape_script_package;
 	}
@@ -1693,7 +1813,7 @@ void janus_duktape_create_session(janus_plugin_session *handle, int *error) {
 	if(g_atomic_int_get(&duktape_stopping) || !g_atomic_int_get(&duktape_initialized)) {
 		*error = -1;
 		return;
-	}	
+	}
 	janus_mutex_lock(&duktape_sessions_mutex);
 	uint32_t id = 0;
 	while(id == 0) {
@@ -1728,6 +1848,7 @@ void janus_duktape_create_session(janus_plugin_session *handle, int *error) {
 		JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 	}
 	duk_pop(t);
+	duk_pop(duktape_ctx);
 	janus_mutex_unlock(&duktape_mutex);
 
 	return;
@@ -1737,7 +1858,7 @@ void janus_duktape_destroy_session(janus_plugin_session *handle, int *error) {
 	if(g_atomic_int_get(&duktape_stopping) || !g_atomic_int_get(&duktape_initialized)) {
 		*error = -1;
 		return;
-	}	
+	}
 	janus_mutex_lock(&duktape_sessions_mutex);
 	janus_duktape_session *session = janus_duktape_lookup_session(handle);
 	if(!session) {
@@ -1763,6 +1884,7 @@ void janus_duktape_destroy_session(janus_plugin_session *handle, int *error) {
 		JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 	}
 	duk_pop(t);
+	duk_pop(duktape_ctx);
 	janus_mutex_unlock(&duktape_mutex);
 
 	/* Get any rid references recipients of this sessions may have */
@@ -1790,7 +1912,7 @@ void janus_duktape_destroy_session(janus_plugin_session *handle, int *error) {
 json_t *janus_duktape_query_session(janus_plugin_session *handle) {
 	if(g_atomic_int_get(&duktape_stopping) || !g_atomic_int_get(&duktape_initialized)) {
 		return NULL;
-	}	
+	}
 	janus_mutex_lock(&duktape_sessions_mutex);
 	janus_duktape_session *session = janus_duktape_lookup_session(handle);
 	if(!session) {
@@ -1813,12 +1935,14 @@ json_t *janus_duktape_query_session(janus_plugin_session *handle) {
 		json_t *json = json_object();
 		json_object_set_new(json, "error", json_string(duk_safe_to_string(t, -1)));
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_refcount_decrease(&session->ref);
 		return json;
 	}
 	janus_refcount_decrease(&session->ref);
 	const char *info = duk_get_string(t, -1);
 	duk_pop(t);
+	duk_pop(duktape_ctx);
 	/* We need a Jansson object */
 	json_error_t error;
 	json_t *json = json_loads(info, 0, &error);
@@ -1869,10 +1993,10 @@ struct janus_plugin_result *janus_duktape_handle_message(janus_plugin_session *h
 		/* Something went wrong... */
 		JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		return janus_plugin_result_new(JANUS_PLUGIN_ERROR, "Duktape error", NULL);
 	}
-	//~ duk_pop(duktape_ctx);
 	janus_refcount_decrease(&session->ref);
 	if(message_text != NULL)
 		free(message_text);
@@ -1884,6 +2008,7 @@ struct janus_plugin_result *janus_duktape_handle_message(janus_plugin_session *h
 		/* Either an error or an asynchronous response */
 		int res = (int)duk_get_number(t, 0);
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		if(res < 0) {
 			/* We got an error */
@@ -1897,6 +2022,7 @@ struct janus_plugin_result *janus_duktape_handle_message(janus_plugin_session *h
 		json_error_t error;
 		json_t *json = json_loads(response, 0, &error);
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		if(!json) {
 			JANUS_LOG(LOG_ERR, "JSON error: on line %d: %s\n", error.line, error.text);
@@ -1905,7 +2031,45 @@ struct janus_plugin_result *janus_duktape_handle_message(janus_plugin_session *h
 		return janus_plugin_result_new(JANUS_PLUGIN_OK, NULL, json);
 	}
 	/* If we got here, we didn't get what we expect */
+	duk_pop(t);
+	duk_pop(duktape_ctx);
+	janus_mutex_unlock(&duktape_mutex);
 	return janus_plugin_result_new(JANUS_PLUGIN_ERROR, "Duktape error", NULL);
+}
+
+json_t *janus_duktape_handle_admin_message(json_t *message) {
+	if(!has_handle_admin_message || message == NULL)
+		return NULL;
+	char *message_text = json_dumps(message, JSON_INDENT(0) | JSON_PRESERVE_ORDER);
+	/* Invoke the script function */
+	janus_mutex_lock(&duktape_mutex);
+	duk_idx_t thr_idx = duk_push_thread(duktape_ctx);
+	duk_context *t = duk_get_context(duktape_ctx, thr_idx);
+	duk_get_global_string(t, "handleAdminMessage");
+	duk_push_string(t, message_text);
+	int res = duk_pcall(t, 1);
+	if(res != DUK_EXEC_SUCCESS) {
+		/* Something went wrong... */
+		JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
+		duk_pop(t);
+		duk_pop(duktape_ctx);
+		janus_mutex_unlock(&duktape_mutex);
+		return NULL;
+	}
+	if(message_text != NULL)
+		free(message_text);
+	/* Get the response */
+	const char *response = duk_get_string(t, 0);
+	json_error_t error;
+	json_t *json = json_loads(response, 0, &error);
+	duk_pop(t);
+	duk_pop(duktape_ctx);
+	janus_mutex_unlock(&duktape_mutex);
+	if(!json) {
+		JANUS_LOG(LOG_ERR, "JSON error: on line %d: %s\n", error.line, error.text);
+		return NULL;
+	}
+	return json;
 }
 
 void janus_duktape_setup_media(janus_plugin_session *handle) {
@@ -1941,20 +2105,24 @@ void janus_duktape_setup_media(janus_plugin_session *handle) {
 		JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 	}
 	duk_pop(t);
+	duk_pop(duktape_ctx);
 	janus_mutex_unlock(&duktape_mutex);
 	janus_refcount_decrease(&session->ref);
 }
 
-void janus_duktape_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len) {
+void janus_duktape_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *rtp_packet) {
 	if(handle == NULL || handle->stopped || g_atomic_int_get(&duktape_stopping) || !g_atomic_int_get(&duktape_initialized))
 		return;
-	janus_duktape_session *session = (janus_duktape_session *)handle->plugin_handle;	
+	janus_duktape_session *session = (janus_duktape_session *)handle->plugin_handle;
 	if(!session) {
 		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 		return;
 	}
 	if(g_atomic_int_get(&session->destroyed) || g_atomic_int_get(&session->hangingup))
 		return;
+	gboolean video = rtp_packet->video;
+	char *buf = rtp_packet->buffer;
+	uint16_t len = rtp_packet->length;
 	/* Check if the JS script wants to handle/manipulate RTP packets itself */
 	if(has_incoming_rtp) {
 		/* Yep, pass the data to the JS script and return */
@@ -1972,6 +2140,7 @@ void janus_duktape_incoming_rtp(janus_plugin_session *handle, int video, char *b
 			JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 		}
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		return;
 	}
@@ -2000,15 +2169,12 @@ void janus_duktape_incoming_rtp(janus_plugin_session *handle, int video, char *b
 		gint64 now = janus_get_monotonic_time();
 		if((now-session->pli_latest) >= ((gint64)session->pli_freq*G_USEC_PER_SEC)) {
 			session->pli_latest = now;
-			char rtcpbuf[12];
-			janus_rtcp_pli((char *)&rtcpbuf, 12);
-			JANUS_LOG(LOG_HUGE, "Sending PLI to session %"SCNu32"\n", session->id);
-			janus_core->relay_rtcp(handle, 1, rtcpbuf, 12);
+			janus_core->send_pli(handle);
 		}
 	}
 }
 
-void janus_duktape_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len) {
+void janus_duktape_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet) {
 	if(handle == NULL || handle->stopped || g_atomic_int_get(&duktape_stopping) || !g_atomic_int_get(&duktape_initialized))
 		return;
 	janus_duktape_session *session = (janus_duktape_session *)handle->plugin_handle;
@@ -2018,6 +2184,9 @@ void janus_duktape_incoming_rtcp(janus_plugin_session *handle, int video, char *
 	}
 	if(g_atomic_int_get(&session->destroyed) || g_atomic_int_get(&session->hangingup))
 		return;
+	gboolean video = packet->video;
+	char *buf = packet->buffer;
+	uint16_t len = packet->length;
 	/* Check if the JS script wants to handle/manipulate RTCP packets itself */
 	if(has_incoming_rtcp) {
 		/* Yep, pass the data to the JS script and return */
@@ -2035,19 +2204,15 @@ void janus_duktape_incoming_rtcp(janus_plugin_session *handle, int video, char *
 			JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 		}
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		return;
 	}
 	/* If a REMB arrived, make sure we cap it to our configuration, and send it as a video RTCP */
 	uint32_t bitrate = janus_rtcp_get_remb(buf, len);
 	if(bitrate > 0) {
-		if(session->bitrate > 0) {
-			char rtcpbuf[24];
-			janus_rtcp_remb((char *)(&rtcpbuf), 24, session->bitrate);
-			janus_core->relay_rtcp(handle, 1, rtcpbuf, 24);
-		} else {
-			janus_core->relay_rtcp(handle, 1, buf, len);
-		}
+		/* No limit ~= 10000000 */
+		janus_core->send_remb(handle, session->bitrate ? session->bitrate : 10000000);
 	}
 	/* If there's an incoming PLI, instead, relay it to the source of the media if any */
 	if(janus_rtcp_has_pli(buf, len)) {
@@ -2055,16 +2220,14 @@ void janus_duktape_incoming_rtcp(janus_plugin_session *handle, int video, char *
 			janus_mutex_lock_nodebug(&session->sender->recipients_mutex);
 			/* Send a PLI */
 			session->sender->pli_latest = janus_get_monotonic_time();
-			char rtcpbuf[12];
-			janus_rtcp_pli((char *)&rtcpbuf, 12);
 			JANUS_LOG(LOG_HUGE, "Sending PLI to session %"SCNu32"\n", session->sender->id);
-			janus_core->relay_rtcp(session->sender->handle, 1, rtcpbuf, 12);
+			janus_core->send_pli(session->sender->handle);
 			janus_mutex_unlock_nodebug(&session->sender->recipients_mutex);
 		}
 	}
 }
 
-void janus_duktape_incoming_data(janus_plugin_session *handle, char *buf, int len) {
+void janus_duktape_incoming_data(janus_plugin_session *handle, janus_plugin_data *packet) {
 	if(handle == NULL || handle->stopped || g_atomic_int_get(&duktape_stopping) || !g_atomic_int_get(&duktape_initialized))
 		return;
 	janus_duktape_session *session = (janus_duktape_session *)handle->plugin_handle;
@@ -2074,16 +2237,21 @@ void janus_duktape_incoming_data(janus_plugin_session *handle, char *buf, int le
 	}
 	if(g_atomic_int_get(&session->destroyed) || g_atomic_int_get(&session->hangingup))
 		return;
+	char *buf = packet->buffer;
+	uint16_t len = packet->length;
 	/* Are we recording? */
 	janus_recorder_save_frame(session->drc, buf, len);
 	/* Check if the JS script wants to handle/manipulate data channel packets itself */
-	if(has_incoming_data) {
+	if((!packet->binary && (has_incoming_data_legacy || has_incoming_text_data)) || (packet->binary && has_incoming_binary_data)) {
 		/* Yep, pass the data to the JS script and return */
+		if(packet->binary && !has_incoming_text_data)
+			JANUS_LOG(LOG_WARN, "Missing 'incomingTextData', invoking deprecated function 'incomingData' instead\n");
 		janus_mutex_lock(&duktape_mutex);
 		duk_idx_t thr_idx = duk_push_thread(duktape_ctx);
 		duk_context *t = duk_get_context(duktape_ctx, thr_idx);
-		duk_get_global_string(t, "incomingData");
+		duk_get_global_string(t, packet->binary ? "incomingBinaryData" : (has_incoming_text_data ? "incomingTextData" : "incomingData"));
 		duk_push_number(t, session->id);
+		/* We use a string for both text and binary data */
 		duk_push_lstring(t, buf, len);
 		duk_push_number(t, len);
 		int res = duk_pcall(t, 3);
@@ -2092,26 +2260,25 @@ void janus_duktape_incoming_data(janus_plugin_session *handle, char *buf, int le
 			JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 		}
 		duk_pop(t);
+		duk_pop(duktape_ctx);
 		janus_mutex_unlock(&duktape_mutex);
 		return;
 	}
 	/* Is this session allowed to send data? */
 	if(!session->send_data)
 		return;
-	/* Get a string out of the data */
-	char *text = g_malloc0(len+1);
-	if(text == NULL) {
-		JANUS_LOG(LOG_FATAL, "Memory error!\n");
-		return;
-	}
-	memcpy(text, buf, len);
-	*(text+len) = '\0';
-	JANUS_LOG(LOG_VERB, "Got a DataChannel message (%zu bytes) to forward: %s\n", strlen(text), text);
+	JANUS_LOG(LOG_VERB, "Got a %s DataChannel message (%d bytes) to forward\n",
+		packet->binary ? "binary" : "text", len);
 	/* Relay to all recipients */
+	janus_duktape_rtp_relay_packet pkt;
+	pkt.data = (rtp_header *)buf;
+	pkt.length = len;
+	pkt.is_rtp = FALSE;
+	pkt.textdata = !packet->binary;
 	janus_mutex_lock_nodebug(&session->recipients_mutex);
-	g_slist_foreach(session->recipients, janus_duktape_relay_data_packet, text);
+	/* FIXME We should add support for labels, here */
+	g_slist_foreach(session->recipients, janus_duktape_relay_data_packet, &pkt);
 	janus_mutex_unlock_nodebug(&session->recipients_mutex);
-	g_free(text);
 }
 
 void janus_duktape_slow_link(janus_plugin_session *handle, int uplink, int video) {
@@ -2127,7 +2294,27 @@ void janus_duktape_slow_link(janus_plugin_session *handle, int uplink, int video
 	janus_mutex_unlock(&duktape_sessions_mutex);
 	if(g_atomic_int_get(&session->destroyed) || g_atomic_int_get(&session->hangingup))
 		return;
-	/* TODO Handle feedback depending on the logic the JS script dictated */
+	/* Check if the Duktape script wants to handle such events */
+	janus_refcount_increase(&session->ref);
+	if(has_slow_link) {
+		/* Notify the JS script */
+		janus_mutex_lock(&duktape_mutex);
+		duk_idx_t thr_idx = duk_push_thread(duktape_ctx);
+		duk_context *t = duk_get_context(duktape_ctx, thr_idx);
+		duk_get_global_string(t, "slowLink");
+		duk_push_number(t, session->id);
+		duk_push_boolean(t, uplink);
+		duk_push_boolean(t, video);
+		int res = duk_pcall(t, 3);
+		if(res != DUK_EXEC_SUCCESS) {
+			/* Something went wrong... */
+			JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
+		}
+		duk_pop(t);
+		duk_pop(duktape_ctx);
+		janus_mutex_unlock(&duktape_mutex);
+	}
+	janus_refcount_decrease(&session->ref);
 }
 
 void janus_duktape_hangup_media(janus_plugin_session *handle) {
@@ -2188,6 +2375,7 @@ void janus_duktape_hangup_media(janus_plugin_session *handle) {
 		JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 	}
 	duk_pop(t);
+	duk_pop(duktape_ctx);
 	janus_mutex_unlock(&duktape_mutex);
 	janus_refcount_decrease(&session->ref);
 }
@@ -2203,17 +2391,20 @@ static void janus_duktape_relay_rtp_packet(gpointer data, gpointer user_data) {
 	if(!session || !session->handle || !g_atomic_int_get(&session->started)) {
 		return;
 	}
-	
+
 	/* Check if this recipient is willing/allowed to receive this medium */
 	if((packet->is_video && !session->accept_video) || (!packet->is_video && !session->accept_audio)) {
 		/* Nope, don't relay */
 		return;
 	}
 	/* Fix sequence number and timestamp (publisher switching may be involved) */
-	janus_rtp_header_update(packet->data, &session->rtpctx, packet->is_video, packet->is_video ? 4500 : 960);
+	janus_rtp_header_update(packet->data, &session->rtpctx, packet->is_video, 0);
 	/* Send the packet */
-	if(janus_core != NULL)
-		janus_core->relay_rtp(session->handle, packet->is_video, (char *)packet->data, packet->length);
+	if(janus_core != NULL) {
+		janus_plugin_rtp rtp = { .video = packet->is_video, .buffer = (char *)packet->data, .length = packet->length };
+		janus_plugin_rtp_extensions_reset(&rtp.extensions);
+		janus_core->relay_rtp(session->handle, &rtp);
+	}
 	/* Restore the timestamp and sequence number to what the publisher set them to */
 	packet->data->timestamp = htonl(packet->timestamp);
 	packet->data->seq_number = htons(packet->seq_number);
@@ -2222,15 +2413,21 @@ static void janus_duktape_relay_rtp_packet(gpointer data, gpointer user_data) {
 }
 
 static void janus_duktape_relay_data_packet(gpointer data, gpointer user_data) {
+	janus_duktape_rtp_relay_packet *packet = (janus_duktape_rtp_relay_packet *)user_data;
+	if(!packet || packet->is_rtp || !packet->data || packet->length < 1) {
+		JANUS_LOG(LOG_ERR, "Invalid packet...\n");
+		return;
+	}
 	janus_duktape_session *session = (janus_duktape_session *)data;
 	if(!session || !session->handle || !g_atomic_int_get(&session->started) || !session->accept_data) {
 		return;
 	}
-	char *text = (char *)user_data;
-	if(janus_core != NULL && text != NULL) {
-		JANUS_LOG(LOG_VERB, "Forwarding DataChannel message (%zu bytes) to session %"SCNu32": %s\n",
-			strlen(text), session->id, text);
-		janus_core->relay_data(session->handle, text, strlen(text));
+	if(janus_core != NULL) {
+		JANUS_LOG(LOG_VERB, "Forwarding %s DataChannel message (%d bytes) to session %"SCNu32"\n",
+			packet->textdata ? "text" : "binary", packet->length, session->id);
+		janus_plugin_data data = { .label = NULL, .binary = !packet->textdata,
+			.buffer = (char *)packet->data, .length = packet->length };
+		janus_core->relay_data(session->handle, &data);
 	}
 	return;
 }
@@ -2252,8 +2449,8 @@ static void *janus_duktape_scheduler(void *data) {
 			int res = duk_pcall(duktape_ctx, 0);
 			if(res != DUK_EXEC_SUCCESS) {
 				JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(duktape_ctx, -1));
-				duk_pop(duktape_ctx);
 			}
+			duk_pop(duktape_ctx);
 			/* Print the count of elements into Duktape stack */
 			janus_duktape_stackdump(duktape_ctx);
 			janus_mutex_unlock(&duktape_mutex);
@@ -2296,6 +2493,7 @@ static gboolean janus_duktape_timer_cb(void *data) {
 		JANUS_LOG(LOG_ERR, "Duktape error: %s\n", duk_safe_to_string(t, -1));
 	}
 	duk_pop(t);
+	duk_pop(duktape_ctx);
 	janus_mutex_unlock(&duktape_mutex);
 	/* Done */
 	g_source_destroy(cb->source);

@@ -4,7 +4,7 @@
  * \brief    DTLS/SRTP processing
  * \details  Implementation (based on OpenSSL and libsrtp) of the DTLS/SRTP
  * transport. The code takes care of the DTLS handshake between peers and
- * the gateway, and sets the proper SRTP and SRTCP context up accordingly.
+ * the server, and sets the proper SRTP and SRTCP context up accordingly.
  * A DTLS alert from a peer is notified to the plugin handling him/her
  * by means of the hangup_media callback.
  *
@@ -96,15 +96,34 @@ static void janus_dtls_notify_state_change(janus_dtls_srtp *dtls) {
 	json_object_set_new(info, "stream_id", json_integer(stream->stream_id));
 	json_object_set_new(info, "component_id", json_integer(component->component_id));
 	json_object_set_new(info, "retransmissions", json_integer(dtls->retransmissions));
-	janus_events_notify_handlers(JANUS_EVENT_TYPE_WEBRTC, session->session_id, handle->handle_id, handle->opaque_id, info);
+	janus_events_notify_handlers(JANUS_EVENT_TYPE_WEBRTC, JANUS_EVENT_SUBTYPE_WEBRTC_DTLS,
+		session->session_id, handle->handle_id, handle->opaque_id, info);
 }
 
+gboolean janus_is_dtls(char *buf) {
+	return ((*buf >= 20) && (*buf <= 64));
+}
 
 /* DTLS stuff */
-#define DTLS_CIPHERS	"HIGH:!aNULL:!MD5:!RC4"
+#define DTLS_DEFAULT_CIPHERS	"DEFAULT:!NULL:!aNULL:!SHA256:!SHA384:!aECDH:!AESGCM+AES256:!aPSK"
+static const char *dtls_ciphers = DTLS_DEFAULT_CIPHERS;
 /* Duration for the self-generated certs: 1 year */
 #define DTLS_AUTOCERT_DURATION	60*60*24*365
+/* NIST P-256 elliptic curve used for private key generation */
+#define DTLS_ELLIPTIC_CURVE NID_X9_62_prime256v1
 
+/* By default we always accept self-signed certificates (that's what almost
+ * all of the existing WebRTC implementations do today), but if told so we
+ * can be configured to reject them, and validate them instead */
+static gboolean dtls_selfsigned_certs_ok = TRUE;
+gboolean janus_dtls_are_selfsigned_certs_ok(void) {
+	return dtls_selfsigned_certs_ok;
+}
+
+/* DTLS timeout base to enforce: notice that this can currently only be
+ * modified if you're using BoringSSL, as OpenSSL uses 1s (1000ms) and
+ * that value cannot be modified (it will in OpenSSL v1.1.1) */
+static guint16 dtls_timeout_base = 1000;
 
 static SSL_CTX *ssl_ctx = NULL;
 static X509 *ssl_cert = NULL;
@@ -142,7 +161,7 @@ gchar *janus_dtls_get_local_fingerprint(void) {
  * which does indeed implement the callbacks the OpenSSL docs suggest.
  *
  */
-static janus_mutex *janus_dtls_locks;
+static pthread_mutex_t *janus_dtls_locks;
 
 static void janus_dtls_cb_openssl_threadid(CRYPTO_THREADID *tid) {
 	/* FIXME Assuming pthread, which is fine as GLib wraps pthread and
@@ -158,46 +177,22 @@ static void janus_dtls_cb_openssl_threadid(CRYPTO_THREADID *tid) {
 
 static void janus_dtls_cb_openssl_lock(int mode, int type, const char *file, int line) {
 	if((mode & CRYPTO_LOCK)) {
-		janus_mutex_lock(&janus_dtls_locks[type]);
+		pthread_mutex_lock(&janus_dtls_locks[type]);
 	} else {
-		janus_mutex_unlock(&janus_dtls_locks[type]);
+		pthread_mutex_unlock(&janus_dtls_locks[type]);
 	}
 }
 #endif
 
 
-static int janus_dtls_generate_keys(X509 **certificate, EVP_PKEY **private_key) {
+static int janus_dtls_generate_keys(X509 **certificate, EVP_PKEY **private_key, gboolean rsa_private_key) {
 	static const int num_bits = 2048;
 	BIGNUM *bne = NULL;
 	RSA *rsa_key = NULL;
 	X509_NAME *cert_name = NULL;
+	EC_KEY *ecc_key = NULL;
 
 	JANUS_LOG(LOG_VERB, "Generating DTLS key / cert\n");
-
-	/* Create a big number object. */
-	bne = BN_new();
-	if(!bne) {
-		JANUS_LOG(LOG_FATAL, "BN_new() failed\n");
-		goto error;
-	}
-
-	if(!BN_set_word(bne, RSA_F4)) {  /* RSA_F4 == 65537 */
-		JANUS_LOG(LOG_FATAL, "BN_set_word() failed\n");
-		goto error;
-	}
-
-	/* Generate a RSA key. */
-	rsa_key = RSA_new();
-	if(!rsa_key) {
-		JANUS_LOG(LOG_FATAL, "RSA_new() failed\n");
-		goto error;
-	}
-
-	/* This takes some time. */
-	if(!RSA_generate_key_ex(rsa_key, num_bits, bne, NULL)) {
-		JANUS_LOG(LOG_FATAL, "RSA_generate_key_ex() failed\n");
-		goto error;
-	}
 
 	/* Create a private key object (needed to hold the RSA key). */
 	*private_key = EVP_PKEY_new();
@@ -206,12 +201,63 @@ static int janus_dtls_generate_keys(X509 **certificate, EVP_PKEY **private_key) 
 		goto error;
 	}
 
-	if(!EVP_PKEY_assign_RSA(*private_key, rsa_key)) {
-		JANUS_LOG(LOG_FATAL, "EVP_PKEY_assign_RSA() failed\n");
-		goto error;
+
+	if(rsa_private_key) {
+		/* Create a big number object. */
+		bne = BN_new();
+		if(!bne) {
+			JANUS_LOG(LOG_FATAL, "BN_new() failed\n");
+			goto error;
+		}
+
+		if(!BN_set_word(bne, RSA_F4)) {  /* RSA_F4 == 65537 */
+			JANUS_LOG(LOG_FATAL, "BN_set_word() failed\n");
+			goto error;
+		}
+
+		/* Generate a RSA key. */
+		rsa_key = RSA_new();
+		if(!rsa_key) {
+			JANUS_LOG(LOG_FATAL, "RSA_new() failed\n");
+			goto error;
+		}
+
+		/* This takes some time. */
+		if(!RSA_generate_key_ex(rsa_key, num_bits, bne, NULL)) {
+			JANUS_LOG(LOG_FATAL, "RSA_generate_key_ex() failed\n");
+			goto error;
+		}
+
+		if(!EVP_PKEY_assign_RSA(*private_key, rsa_key)) {
+			JANUS_LOG(LOG_FATAL, "EVP_PKEY_assign_RSA() failed\n");
+			goto error;
+		}
+
+		/* The RSA key now belongs to the private key, so don't clean it up separately. */
+		rsa_key = NULL;
+	} else {
+		/* Create key with curve dictated by DTLS_ELLIPTIC_CURVE */
+		if((ecc_key = EC_KEY_new_by_curve_name(DTLS_ELLIPTIC_CURVE)) == NULL) {
+			JANUS_LOG(LOG_FATAL, "EC_KEY_new_by_curve_name() failed\n");
+			goto error;
+		}
+
+		EC_KEY_set_asn1_flag(ecc_key, OPENSSL_EC_NAMED_CURVE);
+
+		/* This takes some time. */
+		if(EC_KEY_generate_key(ecc_key) == 0) {
+			JANUS_LOG(LOG_FATAL, "EC_KEY_generate_key() failed\n");
+			goto error;
+		}
+
+		if(EVP_PKEY_assign_EC_KEY(*private_key, ecc_key) == 0) {
+			JANUS_LOG(LOG_FATAL, "EVP_PKEY_assign_EC_KEY() failed\n");
+			goto error;
+		}
+
+		/* The EC key now belongs to the private key, so don't clean it up separately. */
+		ecc_key = NULL;
 	}
-	/* The RSA key now belongs to the private key, so don't clean it up separately. */
-	rsa_key = NULL;
 
 	/* Create the X509 certificate. */
 	*certificate = X509_new();
@@ -266,6 +312,8 @@ error:
 		BN_free(bne);
 	if(rsa_key && !*private_key)
 		RSA_free(rsa_key);
+	if(ecc_key && !*private_key)
+		EC_KEY_free(ecc_key);
 	if(*private_key)
 		EVP_PKEY_free(*private_key);  /* This also frees the RSA key. */
 	if(*certificate)
@@ -316,9 +364,14 @@ error:
 	return -1;
 }
 
+/* Versioning info ( */
+const char *janus_get_ssl_version(void) {
+	return OPENSSL_VERSION_TEXT;
+}
 
 /* DTLS-SRTP initialization */
-gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const char *password) {
+gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const char *password,
+		const char *ciphers, guint16 timeout, gboolean rsa_private_key, gboolean accept_selfsigned) {
 	const char *crypto_lib = NULL;
 #if JANUS_USE_OPENSSL_PRE_1_1_API
 #if defined(LIBRESSL_VERSION_NUMBER)
@@ -330,7 +383,7 @@ gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const 
 	janus_dtls_locks = g_malloc0(sizeof(*janus_dtls_locks) * CRYPTO_num_locks());
 	int l=0;
 	for(l = 0; l < CRYPTO_num_locks(); l++) {
-		janus_mutex_init(&janus_dtls_locks[l]);
+		pthread_mutex_init(&janus_dtls_locks[l], NULL);
 	}
 	CRYPTO_THREADID_set_callback(janus_dtls_cb_openssl_threadid);
 	CRYPTO_set_locking_callback(janus_dtls_cb_openssl_lock);
@@ -347,7 +400,11 @@ gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const 
 
 	/* Go on and create the DTLS context */
 #if JANUS_USE_OPENSSL_PRE_1_1_API
+#if defined(LIBRESSL_VERSION_NUMBER)
 	ssl_ctx = SSL_CTX_new(DTLSv1_method());
+#else
+	ssl_ctx = SSL_CTX_new(DTLSv1_2_method());
+#endif
 #else
 	ssl_ctx = SSL_CTX_new(DTLS_method());
 #endif
@@ -365,7 +422,7 @@ gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const 
 
 	if(!server_pem && !server_key) {
 		JANUS_LOG(LOG_WARN, "No cert/key specified, autogenerating some...\n");
-		if(janus_dtls_generate_keys(&ssl_cert, &ssl_key) != 0) {
+		if(janus_dtls_generate_keys(&ssl_cert, &ssl_key, rsa_private_key) != 0) {
 			JANUS_LOG(LOG_FATAL, "Error generating DTLS key/certificate\n");
 			return -2;
 		}
@@ -404,18 +461,37 @@ gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const 
 	}
 	*(lfp-1) = 0;
 	JANUS_LOG(LOG_INFO, "Fingerprint of our certificate: %s\n", local_fingerprint);
-	SSL_CTX_set_cipher_list(ssl_ctx, DTLS_CIPHERS);
-
-	if(janus_dtls_bio_filter_init() < 0) {
-		JANUS_LOG(LOG_FATAL, "Error initializing BIO filter\n");
+	if(ciphers)
+		dtls_ciphers = ciphers;
+	if(SSL_CTX_set_cipher_list(ssl_ctx, dtls_ciphers) == 0) {
+		JANUS_LOG(LOG_FATAL, "Error setting cipher list (%s)\n", ERR_reason_error_string(ERR_get_error()));
 		return -8;
 	}
+
+	if(janus_dtls_bio_agent_init() < 0) {
+		JANUS_LOG(LOG_FATAL, "Error initializing BIO agent\n");
+		return -9;
+	}
+
+	dtls_timeout_base = timeout;
+#ifndef HAVE_BORINGSSL
+	if(dtls_timeout_base != 1000) {
+		JANUS_LOG(LOG_WARN, "DTLS timeout set to %u ms, but not using BoringSSL: ignoring\n", timeout);
+	}
+#endif
 
 	/* Initialize libsrtp */
 	if(srtp_init() != srtp_err_status_ok) {
 		JANUS_LOG(LOG_FATAL, "Ops, error setting up libsrtp?\n");
-		return 5;
+		return -10;
 	}
+
+	/* Finally, let's set our policy with respect to DTLS self signed certificates */
+	dtls_selfsigned_certs_ok = accept_selfsigned;
+	if(!dtls_selfsigned_certs_ok) {
+		JANUS_LOG(LOG_WARN, "WebRTC PeerConnections with self-signed certificates will NOT be accepted\n");
+	}
+
 	return 0;
 }
 
@@ -430,7 +506,6 @@ static void janus_dtls_srtp_free(const janus_refcount *dtls_ref) {
 	/* BIOs are destroyed by SSL_free */
 	dtls->read_bio = NULL;
 	dtls->write_bio = NULL;
-	dtls->filter_bio = NULL;
 	if(dtls->srtp_valid) {
 		if(dtls->srtp_in) {
 			srtp_dealloc(dtls->srtp_in);
@@ -503,26 +578,14 @@ janus_dtls_srtp *janus_dtls_srtp_create(void *ice_component, janus_dtls_role rol
 		return NULL;
 	}
 	BIO_set_mem_eof_return(dtls->read_bio, -1);
-	dtls->write_bio = BIO_new(BIO_s_mem());
+	dtls->write_bio = BIO_janus_dtls_agent_new(dtls);
 	if(!dtls->write_bio) {
 		JANUS_LOG(LOG_ERR, "[%"SCNu64"]   Error creating write BIO! (%s)\n",
 			handle->handle_id, ERR_reason_error_string(ERR_get_error()));
 		janus_refcount_decrease(&dtls->ref);
 		return NULL;
 	}
-	BIO_set_mem_eof_return(dtls->write_bio, -1);
-	/* The write BIO needs our custom filter, or fragmentation won't work */
-	dtls->filter_bio = BIO_new(BIO_janus_dtls_filter());
-	if(!dtls->filter_bio) {
-		JANUS_LOG(LOG_ERR, "[%"SCNu64"]   Error creating filter BIO! (%s)\n",
-			handle->handle_id, ERR_reason_error_string(ERR_get_error()));
-		janus_refcount_decrease(&dtls->ref);
-		return NULL;
-	}
-	/* Chain filter and write BIOs */
-	BIO_push(dtls->filter_bio, dtls->write_bio);
-	/* Set the filter as the BIO to use for outgoing data */
-	SSL_set_bio(dtls->ssl, dtls->read_bio, dtls->filter_bio);
+	SSL_set_bio(dtls->ssl, dtls->read_bio, dtls->write_bio);
 	/* The role may change later, depending on the negotiation */
 	dtls->dtls_role = role;
 	/* https://code.google.com/p/chromium/issues/detail?id=406458
@@ -542,9 +605,8 @@ janus_dtls_srtp *janus_dtls_srtp_create(void *ice_component, janus_dtls_role rol
 	SSL_set_tmp_ecdh(dtls->ssl, ecdh);
 	EC_KEY_free(ecdh);
 #ifdef HAVE_DTLS_SETTIMEOUT
-	guint ms = 100;
-	JANUS_LOG(LOG_VERB, "[%"SCNu64"]   Setting DTLS initial timeout: %u\n", handle->handle_id, ms);
-	DTLSv1_set_initial_timeout_duration(dtls->ssl, ms);
+	JANUS_LOG(LOG_VERB, "[%"SCNu64"]   Setting DTLS initial timeout: %"SCNu16"ms\n", handle->handle_id, dtls_timeout_base);
+	DTLSv1_set_initial_timeout_duration(dtls->ssl, dtls_timeout_base);
 #endif
 	dtls->ready = 0;
 	dtls->retransmissions = 0;
@@ -571,7 +633,6 @@ void janus_dtls_srtp_handshake(janus_dtls_srtp *dtls) {
 		dtls->dtls_state = JANUS_DTLS_STATE_TRYING;
 	}
 	SSL_do_handshake(dtls->ssl);
-	janus_dtls_fd_bridge(dtls);
 
 	/* Notify event handlers */
 	janus_dtls_notify_state_change(dtls);
@@ -636,14 +697,12 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
 		/* Handshake not started yet: maybe we're still waiting for the answer and the DTLS role? */
 		return;
 	}
-	janus_dtls_fd_bridge(dtls);
 	int written = BIO_write(dtls->read_bio, buf, len);
 	if(written != len) {
 		JANUS_LOG(LOG_WARN, "[%"SCNu64"]     Only written %d/%d of those bytes on the read BIO...\n", handle->handle_id, written, len);
 	} else {
 		JANUS_LOG(LOG_HUGE, "[%"SCNu64"]     Written %d bytes on the read BIO...\n", handle->handle_id, written);
 	}
-	janus_dtls_fd_bridge(dtls);
 	/* Try to read data */
 	char data[1500];	/* FIXME */
 	memset(&data, 0, 1500);
@@ -659,7 +718,6 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
 			return;
 		}
 	}
-	janus_dtls_fd_bridge(dtls);
 	if(janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_STOP) || janus_is_stopping()) {
 		/* DTLS alert triggered, we should end it here */
 		JANUS_LOG(LOG_VERB, "[%"SCNu64"] Forced to stop it here...\n", handle->handle_id);
@@ -728,7 +786,7 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
 			}
 			if(dtls->dtls_state == JANUS_DTLS_STATE_CONNECTED) {
 				/* Which SRTP profile is being negotiated? */
-				SRTP_PROTECTION_PROFILE *srtp_profile = SSL_get_selected_srtp_profile(dtls->ssl);
+				const SRTP_PROTECTION_PROFILE *srtp_profile = SSL_get_selected_srtp_profile(dtls->ssl);
 				if(srtp_profile == NULL) {
 					/* Should never happen, but just in case... */
 					JANUS_LOG(LOG_ERR, "[%"SCNu64"] No SRTP profile selected...\n", handle->handle_id);
@@ -899,11 +957,12 @@ done:
 }
 
 void janus_dtls_srtp_send_alert(janus_dtls_srtp *dtls) {
+	if(!dtls)
+		return;
 	/* Send alert */
 	janus_refcount_increase(&dtls->ref);
 	if(dtls != NULL && dtls->ssl != NULL) {
 		SSL_shutdown(dtls->ssl);
-		janus_dtls_fd_bridge(dtls);
 	}
 	janus_refcount_decrease(&dtls->ref);
 }
@@ -949,69 +1008,33 @@ void janus_dtls_callback(const SSL *ssl, int where, int ret) {
 		JANUS_LOG(LOG_ERR, "No ICE handle related to this alert...\n");
 		return;
 	}
-	JANUS_LOG(LOG_VERB, "[%"SCNu64"] DTLS alert triggered on stream %"SCNu16" (component %"SCNu16"), closing...\n", handle->handle_id, stream->stream_id, component->component_id);
+	JANUS_LOG(LOG_VERB, "[%"SCNu64"] DTLS alert triggered on stream %u (component %u), closing...\n", handle->handle_id, stream->stream_id, component->component_id);
 	janus_ice_webrtc_hangup(handle, "DTLS alert");
 }
 
 /* DTLS certificate verification callback */
 int janus_dtls_verify_callback(int preverify_ok, X509_STORE_CTX *ctx) {
 	/* We just use the verify_callback to request a certificate from the client */
-	return 1;
-}
-
-/* DTLS BIOs to/from socket bridge */
-void janus_dtls_fd_bridge(janus_dtls_srtp *dtls) {
-	if(dtls == NULL) {
-		JANUS_LOG(LOG_ERR, "No DTLS-SRTP stack, no DTLS bridge...\n");
-		return;
-	}
-	janus_ice_component *component = (janus_ice_component *)dtls->component;
-	if(component == NULL) {
-		JANUS_LOG(LOG_ERR, "No component, no DTLS bridge...\n");
-		return;
-	}
-	janus_ice_stream *stream = component->stream;
-	if(!stream) {
-		JANUS_LOG(LOG_ERR, "No stream, no DTLS bridge...\n");
-		return;
-	}
-	janus_ice_handle *handle = stream->handle;
-	if(!handle || !handle->agent || !dtls->write_bio) {
-		JANUS_LOG(LOG_ERR, "No handle/agent/bio, no DTLS bridge...\n");
-		return;
-	}
-	int pending = BIO_ctrl_pending(dtls->filter_bio);
-	while(pending > 0) {
-		JANUS_LOG(LOG_HUGE, "[%"SCNu64"] >> Going to send DTLS data: %d bytes\n", handle->handle_id, pending);
-		char outgoing[pending];
-		int out = BIO_read(dtls->write_bio, outgoing, sizeof(outgoing));
-		JANUS_LOG(LOG_HUGE, "[%"SCNu64"] >> >> Read %d bytes from the write_BIO...\n", handle->handle_id, out);
-		if(out > 1500) {
-			/* FIXME Just a warning for now, this will need to be solved with proper fragmentation */
-			JANUS_LOG(LOG_WARN, "[%"SCNu64"] The DTLS stack is trying to send a packet of %d bytes, this may be larger than the MTU and get dropped!\n", handle->handle_id, out);
+	int err = X509_STORE_CTX_get_error(ctx);
+	if(err == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT || err == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN) {
+		/* Self signed certificate: by default we always accept it */
+		if(!dtls_selfsigned_certs_ok) {
+			/* ... unless we're enforcing validation */
+			return 0;
 		}
-		int bytes = nice_agent_send(handle->agent, component->stream_id, component->component_id, out, outgoing);
-		if(bytes < out) {
-			JANUS_LOG(LOG_ERR, "[%"SCNu64"] Error sending DTLS message on component %d of stream %d (%d)\n", handle->handle_id, component->component_id, stream->stream_id, bytes);
-		} else {
-			JANUS_LOG(LOG_HUGE, "[%"SCNu64"] >> >> ... and sent %d of those bytes on the socket\n", handle->handle_id, bytes);
-		}
-		/* Update stats (TODO Do the same for the last second window as well)
-		 * FIXME: the Data stats includes the bytes used for the handshake */
-		if(bytes > 0) {
-			component->out_stats.data.packets++;
-			component->out_stats.data.bytes += bytes;
-		}
-		/* Check if there's anything left to send (e.g., fragmented packets) */
-		pending = BIO_ctrl_pending(dtls->filter_bio);
 	}
+	/* We always reject expired certificates, even when self-signed */
+	if(err == X509_V_ERR_CERT_HAS_EXPIRED)
+		return 0;
+	/* Return a success if we're ok with self-signed, the result of the validation otherwise */
+	return dtls_selfsigned_certs_ok ? 1 : (err == X509_V_OK);
 }
 
 #ifdef HAVE_SCTP
-void janus_dtls_wrap_sctp_data(janus_dtls_srtp *dtls, char *buf, int len) {
+void janus_dtls_wrap_sctp_data(janus_dtls_srtp *dtls, char *label, gboolean textdata, char *buf, int len) {
 	if(dtls == NULL || !dtls->ready || dtls->sctp == NULL || buf == NULL || len < 1)
 		return;
-	janus_sctp_send_data(dtls->sctp, buf, len);
+	janus_sctp_send_data(dtls->sctp, label, textdata, buf, len);
 }
 
 int janus_dtls_send_sctp_data(janus_dtls_srtp *dtls, char *buf, int len) {
@@ -1021,13 +1044,11 @@ int janus_dtls_send_sctp_data(janus_dtls_srtp *dtls, char *buf, int len) {
 	if(res <= 0) {
 		unsigned long err = SSL_get_error(dtls->ssl, res);
 		JANUS_LOG(LOG_ERR, "Error sending data: %s\n", ERR_reason_error_string(err));
-	} else {
-		janus_dtls_fd_bridge(dtls);
 	}
 	return res;
 }
 
-void janus_dtls_notify_data(janus_dtls_srtp *dtls, char *buf, int len) {
+void janus_dtls_notify_data(janus_dtls_srtp *dtls, char *label, gboolean textdata, char *buf, int len) {
 	if(dtls == NULL || buf == NULL || len < 1)
 		return;
 	janus_ice_component *component = (janus_ice_component *)dtls->component;
@@ -1045,7 +1066,7 @@ void janus_dtls_notify_data(janus_dtls_srtp *dtls, char *buf, int len) {
 		JANUS_LOG(LOG_ERR, "No handle...\n");
 		return;
 	}
-	janus_ice_incoming_data(handle, buf, len);
+	janus_ice_incoming_data(handle, label, textdata, buf, len);
 }
 #endif
 
@@ -1076,7 +1097,10 @@ gboolean janus_dtls_retry(gpointer stack) {
 		goto stoptimer;
 	}
 	struct timeval timeout = {0};
-	DTLSv1_get_timeout(dtls->ssl, &timeout);
+	if(DTLSv1_get_timeout(dtls->ssl, &timeout) == 0) {
+		/* failed to get timeout. try again on next iter */
+		return TRUE;
+	}
 	guint64 timeout_value = timeout.tv_sec*1000 + timeout.tv_usec/1000;
 	JANUS_LOG(LOG_HUGE, "[%"SCNu64"] DTLSv1_get_timeout: %"SCNu64"\n", handle->handle_id, timeout_value);
 	if(timeout_value == 0) {
@@ -1086,7 +1110,6 @@ gboolean janus_dtls_retry(gpointer stack) {
 		janus_dtls_notify_state_change(dtls);
 		/* Retransmit the packet */
 		DTLSv1_handle_timeout(dtls->ssl);
-		janus_dtls_fd_bridge(dtls);
 	}
 	return TRUE;
 

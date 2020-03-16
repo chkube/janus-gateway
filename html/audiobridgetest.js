@@ -23,12 +23,12 @@
 // 		var server = "ws://" + window.location.hostname + ":8188";
 //
 // Of course this assumes that support for WebSockets has been built in
-// when compiling the gateway. WebSockets support has not been tested
+// when compiling the server. WebSockets support has not been tested
 // as much as the REST API, so handle with care!
 //
 //
 // If you have multiple options available, and want to let the library
-// autodetect the best way to contact your gateway (or pool of gateways),
+// autodetect the best way to contact your server (or pool of servers),
 // you can also pass an array of servers, e.g., to provide alternative
 // means of access (e.g., try WebSockets first and, if that fails, fall
 // back to plain HTTP) or just have failover servers:
@@ -77,7 +77,7 @@ $(document).ready(function() {
 				{
 					server: server,
 					success: function() {
-						// Attach to Audio Bridge test plugin
+						// Attach to AudioBridge plugin
 						janus.attach(
 							{
 								plugin: "janus.plugin.audiobridge",
@@ -105,7 +105,7 @@ $(document).ready(function() {
 									Janus.debug("Consent dialog should be " + (on ? "on" : "off") + " now");
 									if(on) {
 										// Darken screen and show hint
-										$.blockUI({ 
+										$.blockUI({
 											message: '<div><img src="up_arrow.png"/></div>',
 											css: {
 												border: 'none',
@@ -128,25 +128,27 @@ $(document).ready(function() {
 									if(event != undefined && event != null) {
 										if(event === "joined") {
 											// Successfully joined, negotiate WebRTC now
-											myid = msg["id"];
-											Janus.log("Successfully joined room " + msg["room"] + " with ID " + myid);
-											if(!webrtcUp) {
-												webrtcUp = true;
-												// Publish our stream
-												mixertest.createOffer(
-													{
-														media: { video: false},	// This is an audio only room
-														success: function(jsep) {
-															Janus.debug("Got SDP!");
-															Janus.debug(jsep);
-															var publish = { "request": "configure", "muted": false };
-															mixertest.send({"message": publish, "jsep": jsep});
-														},
-														error: function(error) {
-															Janus.error("WebRTC error:", error);
-															bootbox.alert("WebRTC error... " + JSON.stringify(error));
-														}
-													});
+											if(msg["id"]) {
+												myid = msg["id"];
+												Janus.log("Successfully joined room " + msg["room"] + " with ID " + myid);
+												if(!webrtcUp) {
+													webrtcUp = true;
+													// Publish our stream
+													mixertest.createOffer(
+														{
+															media: { video: false},	// This is an audio only room
+															success: function(jsep) {
+																Janus.debug("Got SDP!");
+																Janus.debug(jsep);
+																var publish = { "request": "configure", "muted": false };
+																mixertest.send({"message": publish, "jsep": jsep});
+															},
+															error: function(error) {
+																Janus.error("WebRTC error:", error);
+																bootbox.alert("WebRTC error... " + JSON.stringify(error));
+															}
+														});
+												}
 											}
 											// Any room participant?
 											if(msg["participants"] !== undefined && msg["participants"] !== null) {
@@ -247,7 +249,7 @@ $(document).ready(function() {
 													// This is a "no such room" error: give a more meaningful description
 													bootbox.alert(
 														"<p>Apparently room <code>" + myroom + "</code> (the one this demo uses as a test room) " +
-														"does not exist...</p><p>Do you have an updated <code>janus.plugin.audiobridge.cfg</code> " +
+														"does not exist...</p><p>Do you have an updated <code>janus.plugin.audiobridge.jcfg</code> " +
 														"configuration file? If not, make sure you copy the details of room <code>" + myroom + "</code> " +
 														"from that sample in your current configuration file, then restart Janus and try again."
 													);
